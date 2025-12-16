@@ -90,6 +90,11 @@ Outputs:
     - `--latent-motion-center` (default 20 px)
     - `--latent-motion-scale` (default 0.25 area ratio delta)
     - `--latent-motion-boost` (default 6 frames)
+- **Perceptual note (paper discussion point)**:
+  - We tested server-side compaction/reuse (`--latent-period-skip` / `--latent-merge`) and found that in high-motion,
+    rendered content it can **reintroduce visible flashing/mismatch**, even if cosine similarity is high.
+  - The safer approach is to keep **sampling** (periodic + motion boost) and use only the **client last-frame fallback**
+    (reuse the last recoverable template when the current one hasn’t arrived yet).
 - Bbox jitter still matters; recovery resizes template to bbox each frame.
 - This is an **offline simulator**: “new template delivery” is approximated by skipping reconstruction for templates minted in the same frame.
 
