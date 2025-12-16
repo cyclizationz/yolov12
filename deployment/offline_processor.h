@@ -30,6 +30,15 @@ struct OfflineOptions {
     bool yoloLatentKey = false; // YOLO offline simulator: assign template_id via maskCoeff embedding, no hashing on client
     float latentCosineThreshold = 0.95f; // cosine similarity threshold to reuse template_id
 
+    // Latent-key hybrid sampling policy:
+    // - Normally mint a new template every `latentSamplePeriod` frames (e.g. 2 => ~50%).
+    // - If motion is significant, mint every frame for `latentMotionBoostFrames` frames.
+    int latentSamplePeriod = 2;          // base sampling period (frames)
+    float latentMotionIouThr = 0.6f;     // trigger boost if IoU(last_box, cur_box) < this
+    float latentMotionCenterPx = 20.0f;  // trigger boost if center shift (px) > this
+    float latentMotionScaleThr = 0.25f;  // trigger boost if area ratio differs by > this (e.g. 0.25 => 25%)
+    int latentMotionBoostFrames = 6;     // boost window length in frames
+
     // Experiment support: dump per-frame latent embeddings to analyze similarity/thresholds offline.
     bool dumpLatents = false;
     std::string latentsOutPath = ""; // defaults to <outDir>/latents.jsonl when enabled

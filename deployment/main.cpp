@@ -28,6 +28,11 @@ void print_usage(const char* program_name) {
               << "  --timing                Record per-frame timing stats into report.json\n"
               << "  --latent-key            YOLO offline sim: assign template_id by maskCoeff embedding (no client hashing)\n"
               << "  --latent-thr <float>    Cosine similarity threshold for template reuse (default: 0.95)\n"
+              << "  --latent-period <int>   Base sampling period (default: 2 => ~50% templates)\n"
+              << "  --latent-motion-iou <f> Motion trigger IoU threshold (default: 0.6)\n"
+              << "  --latent-motion-center <f> Motion trigger center shift in px (default: 20)\n"
+              << "  --latent-motion-scale <f> Motion trigger area ratio delta (default: 0.25)\n"
+              << "  --latent-motion-boost <int> Boost window frames (default: 6)\n"
               << "  --dump-latents[=PATH]   Dump per-frame latent embeddings to JSONL (default: <outDir>/latents.jsonl)\n"
               << "  --cpu                   Force CPU inference (explicit flag)\n"
               << "  -h                      Show this help message\n";
@@ -46,6 +51,11 @@ int main(int argc, char* argv[]) {
         {"timing", no_argument, 0, 'R'},
         {"latent-key", no_argument, 0, 'L'},
         {"latent-thr", required_argument, 0, 'Z'},
+        {"latent-period", required_argument, 0, 'P'},
+        {"latent-motion-iou", required_argument, 0, 'I'},
+        {"latent-motion-center", required_argument, 0, 'O'},
+        {"latent-motion-scale", required_argument, 0, 'S'},
+        {"latent-motion-boost", required_argument, 0, 'B'},
         {"dump-latents", optional_argument, 0, 'D'},
         {0, 0, 0, 0}
     };
@@ -98,6 +108,21 @@ int main(int argc, char* argv[]) {
                 break;
             case 'Z':
                 opt.latentCosineThreshold = std::stof(optarg);
+                break;
+            case 'P':
+                opt.latentSamplePeriod = std::stoi(optarg);
+                break;
+            case 'I':
+                opt.latentMotionIouThr = std::stof(optarg);
+                break;
+            case 'O':
+                opt.latentMotionCenterPx = std::stof(optarg);
+                break;
+            case 'S':
+                opt.latentMotionScaleThr = std::stof(optarg);
+                break;
+            case 'B':
+                opt.latentMotionBoostFrames = std::stoi(optarg);
                 break;
             case 'D':
                 opt.dumpLatents = true;

@@ -307,6 +307,24 @@ static float iou_rect(const cv::Rect &a, const cv::Rect &b) {
     return ua > 0 ? (float)inter / (float)ua : 0.0f;
 }
 
+static float center_dist_px(const cv::Rect &a, const cv::Rect &b) {
+    float ax = a.x + a.width * 0.5f;
+    float ay = a.y + a.height * 0.5f;
+    float bx = b.x + b.width * 0.5f;
+    float by = b.y + b.height * 0.5f;
+    float dx = ax - bx;
+    float dy = ay - by;
+    return std::sqrt(dx * dx + dy * dy);
+}
+
+static float area_ratio_delta(const cv::Rect &a, const cv::Rect &b) {
+    float aa = (float)std::max(1, a.area());
+    float ba = (float)std::max(1, b.area());
+    float r = ba / aa;
+    // delta from 1.0 (e.g. 1.25 => 0.25, 0.8 => 0.2)
+    return std::abs(r - 1.0f);
+}
+
 static std::array<float, 32> l2_normalize_32(const std::array<float, 32> &v) {
     double s2 = 0.0;
     for (float x : v) s2 += (double)x * (double)x;
@@ -970,6 +988,7 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
         bool valid{false};
     };
     std::unordered_map<int, LastLatent> last_latent_by_class;
+    std::unordered_map<int, int> latent_boost_until_frame; // per class
     
     int frameIdx = 0;
     cv::Mat frame;
@@ -1083,6 +1102,28 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                     // Normalize embedding
                     std::array<float, 32> emb = l2_normalize_32(d.maskCoeff);
 
+                    // Hybrid sampling: base periodic mint + motion-triggered boost
+                    bool force_mint = false;
+                    if (opt.latentSamplePeriod > 0 && (frameIdx % opt.latentSamplePeriod) == 0) {
+                        force_mint = true;
+                    }
+
+                    // Motion detection vs last box for this class
+                    auto itLastBox = last_latent_by_class.find(d.classId);
+                    if (itLastBox != last_latent_by_class.end() && itLastBox->second.valid) {
+                        float iou = iou_rect(itLastBox->second.box, safeBox);
+                        float cdist = center_dist_px(itLastBox->second.box, safeBox);
+                        float ad = area_ratio_delta(itLastBox->second.box, safeBox);
+                        if (iou < opt.latentMotionIouThr || cdist > opt.latentMotionCenterPx || ad > opt.latentMotionScaleThr) {
+                            latent_boost_until_frame[d.classId] = frameIdx + std::max(0, opt.latentMotionBoostFrames);
+                        }
+                    }
+                    auto itBoost = latent_boost_until_frame.find(d.classId);
+                    if (itBoost != latent_boost_until_frame.end() && frameIdx < itBoost->second) {
+                        // In boost window, mint every frame for fluency
+                        force_mint = true;
+                    }
+
                     // Temporal stability: if last template for this class overlaps strongly, prefer it
                     uint32_t chosen_id = 0;
                     bool is_new = false;
@@ -1098,7 +1139,7 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                     }
 
                     // Global search if no temporal reuse
-                    if (chosen_id == 0) {
+                    if (chosen_id == 0 && !force_mint) {
                         float bestSim = -1.0f;
                         uint32_t bestId = 0;
                         for (const auto &tpl : latent_bank) {
@@ -1115,7 +1156,7 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                         }
                     }
 
-                    if (chosen_id == 0) {
+                    if (chosen_id == 0 || force_mint) {
                         // Mint new template_id and save RGBA template
                         chosen_id = next_template_id++;
                         is_new = true;
@@ -1388,6 +1429,11 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
     if (opt.yoloLatentKey) {
         report["latent_bank_size"] = (uint64_t)latent_bank.size();
         report["latent_cosine_threshold"] = opt.latentCosineThreshold;
+        report["latent_sample_period"] = opt.latentSamplePeriod;
+        report["latent_motion_iou_thr"] = opt.latentMotionIouThr;
+        report["latent_motion_center_px"] = opt.latentMotionCenterPx;
+        report["latent_motion_scale_thr"] = opt.latentMotionScaleThr;
+        report["latent_motion_boost_frames"] = opt.latentMotionBoostFrames;
     }
     report["latents_dump_enabled"] = opt.dumpLatents;
     if (opt.dumpLatents) {

@@ -83,6 +83,13 @@ Outputs:
 - `--latent-thr`:
   - Higher (e.g. 0.97): fewer reuses, more templates, less risk of mismatch.
   - Lower (e.g. 0.92): more reuse, smaller template bank, potentially more boundary mismatch.
+- **Hybrid sampling (recommended for rendered games)**:
+  - `--latent-period 2` mints a new template about **every other frame** (helps recover quality/fluency).
+  - Motion-triggered boost mints **more aggressively** during rapid motion:
+    - `--latent-motion-iou` (default 0.6)
+    - `--latent-motion-center` (default 20 px)
+    - `--latent-motion-scale` (default 0.25 area ratio delta)
+    - `--latent-motion-boost` (default 6 frames)
 - Bbox jitter still matters; recovery resizes template to bbox each frame.
 - This is an **offline simulator**: “new template delivery” is approximated by skipping reconstruction for templates minted in the same frame.
 
