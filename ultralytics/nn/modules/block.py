@@ -1,6 +1,7 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 """Block modules."""
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -47,6 +48,10 @@ __all__ = (
     "CIB",
     "C2fCIB",
     "Attention",
+    "AttentionNoPE",
+    "AttentionRPE",
+    "AttentionRoPE",
+    "RelativePositionBias",
     "PSA",
     "SCDown",
     "TorchVision",
@@ -921,6 +926,333 @@ class Attention(nn.Module):
         return x
 
 
+class AttentionNoPE(nn.Module):
+    """
+    Attention module without positional encoding (baseline for YOLOv12).
+    
+    This is the baseline variant that removes positional encoding entirely,
+    matching YOLOv12's design choice for speed optimization.
+    
+    Args:
+        dim (int): The input tensor dimension.
+        num_heads (int): The number of attention heads.
+        attn_ratio (float): The ratio of the attention key dimension to the head dimension.
+    """
+
+    def __init__(self, dim, num_heads=8, attn_ratio=0.5):
+        """Initializes multi-head attention module without positional encoding."""
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.key_dim = int(self.head_dim * attn_ratio)
+        self.scale = self.key_dim**-0.5
+        nh_kd = self.key_dim * num_heads
+        h = dim + nh_kd * 2
+        self.qkv = Conv(dim, h, 1, act=False)
+        self.proj = Conv(dim, dim, 1, act=False)
+        # No positional encoding
+
+    def forward(self, x):
+        """
+        Forward pass of the Attention module without positional encoding.
+        
+        Args:
+            x (torch.Tensor): The input tensor with shape (B, C, H, W).
+        
+        Returns:
+            (torch.Tensor): The output tensor after self-attention.
+        """
+        B, C, H, W = x.shape
+        N = H * W
+        qkv = self.qkv(x)
+        q, k, v = qkv.view(B, self.num_heads, self.key_dim * 2 + self.head_dim, N).split(
+            [self.key_dim, self.key_dim, self.head_dim], dim=2
+        )
+
+        attn = (q.transpose(-2, -1) @ k) * self.scale
+        attn = attn.softmax(dim=-1)
+        x = (v @ attn.transpose(-2, -1)).view(B, C, H, W)
+        x = self.proj(x)
+        return x
+
+
+class RelativePositionBias(nn.Module):
+    """
+    Relative Position Bias module for Swin-style attention.
+    
+    Creates a learnable bias table for relative positional offsets.
+    """
+    
+    def __init__(self, window_size, num_heads):
+        """
+        Initialize relative position bias table.
+        
+        Args:
+            window_size (tuple): (H, W) spatial dimensions of the feature map
+            num_heads (int): Number of attention heads
+        """
+        super().__init__()
+        self.window_size = window_size
+        self.num_heads = num_heads
+        H, W = window_size
+        
+        # Create relative position bias table: (2*H-1, 2*W-1, num_heads)
+        self.relative_position_bias_table = nn.Parameter(
+            torch.zeros((2 * H - 1) * (2 * W - 1), num_heads)
+        )
+        
+        # Get pair-wise relative position index
+        coords_h = torch.arange(H)
+        coords_w = torch.arange(W)
+        coords = torch.stack(torch.meshgrid([coords_h, coords_w], indexing='ij'))
+        coords_flatten = torch.flatten(coords, 1)
+        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]
+        relative_coords = relative_coords.permute(1, 2, 0).contiguous()
+        relative_coords[:, :, 0] += H - 1
+        relative_coords[:, :, 1] += W - 1
+        relative_coords[:, :, 0] *= 2 * W - 1
+        relative_position_index = relative_coords.sum(-1)
+        self.register_buffer("relative_position_index", relative_position_index)
+        
+        # Initialize bias
+        nn.init.trunc_normal_(self.relative_position_bias_table, std=0.02)
+    
+    def forward(self):
+        """Get relative position bias."""
+        relative_position_bias = self.relative_position_bias_table[
+            self.relative_position_index.view(-1)
+        ].view(self.window_size[0] * self.window_size[1], 
+               self.window_size[0] * self.window_size[1], -1)
+        return relative_position_bias.permute(2, 0, 1).contiguous()
+
+
+class AttentionRPE(nn.Module):
+    """
+    Attention module with Relative Positional Bias (RPE).
+    
+    Implements Swin Transformer-style relative positional bias for attention.
+    This adds learnable bias terms based on relative spatial positions.
+    
+    Args:
+        dim (int): The input tensor dimension.
+        num_heads (int): The number of attention heads.
+        attn_ratio (float): The ratio of the attention key dimension to the head dimension.
+    """
+
+    def __init__(self, dim, num_heads=8, attn_ratio=0.5):
+        """Initializes multi-head attention module with relative positional bias."""
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.key_dim = int(self.head_dim * attn_ratio)
+        self.scale = self.key_dim**-0.5
+        nh_kd = self.key_dim * num_heads
+        h = dim + nh_kd * 2
+        self.qkv = Conv(dim, h, 1, act=False)
+        self.proj = Conv(dim, dim, 1, act=False)
+        # RPE will be created dynamically based on input size
+        self.rpe = None
+        self.current_size = None
+
+    def _get_rpe(self, H, W):
+        """Get or create relative position bias for given spatial size."""
+        if self.rpe is None or self.current_size != (H, W):
+            self.rpe = RelativePositionBias((H, W), self.num_heads)
+            self.current_size = (H, W)
+            if next(self.qkv.parameters()).is_cuda:
+                self.rpe = self.rpe.cuda()
+        return self.rpe()
+
+    def forward(self, x):
+        """
+        Forward pass of the Attention module with relative positional bias.
+        
+        Args:
+            x (torch.Tensor): The input tensor with shape (B, C, H, W).
+        
+        Returns:
+            (torch.Tensor): The output tensor after self-attention.
+        """
+        B, C, H, W = x.shape
+        N = H * W
+        qkv = self.qkv(x)
+        q, k, v = qkv.view(B, self.num_heads, self.key_dim * 2 + self.head_dim, N).split(
+            [self.key_dim, self.key_dim, self.head_dim], dim=2
+        )
+
+        attn = (q.transpose(-2, -1) @ k) * self.scale
+        
+        # Add relative positional bias
+        relative_bias = self._get_rpe(H, W)  # (num_heads, N, N)
+        attn = attn + relative_bias.unsqueeze(0)  # Add batch dimension
+        
+        attn = attn.softmax(dim=-1)
+        x = (v @ attn.transpose(-2, -1)).view(B, C, H, W)
+        x = self.proj(x)
+        return x
+
+
+def apply_rotary_pos_emb_2d(q, k, freqs_cis):
+    """
+    Apply 2D rotary positional embedding to query and key tensors.
+    
+    Args:
+        q: Query tensor of shape (B, num_heads, N, head_dim)
+        k: Key tensor of shape (B, num_heads, N, head_dim)
+        freqs_cis: Frequency tensor for RoPE of shape (N, head_dim//2) as complex numbers
+    
+    Returns:
+        q_rot, k_rot: Rotated query and key tensors
+    """
+    # Reshape to apply complex rotation
+    # Split head_dim into pairs for complex representation
+    head_dim = q.shape[-1]
+    assert head_dim % 2 == 0, "head_dim must be even for RoPE"
+    
+    # Reshape to (B, num_heads, N, head_dim//2, 2) for complex representation
+    q_complex = q.view(*q.shape[:-1], head_dim // 2, 2)
+    k_complex = k.view(*k.shape[:-1], head_dim // 2, 2)
+    
+    # Convert to complex
+    q_complex = torch.view_as_complex(q_complex.float())
+    k_complex = torch.view_as_complex(k_complex.float())
+    
+    # Reshape freqs_cis for broadcasting: (1, 1, N, head_dim//2)
+    # freqs_cis is already complex, shape (N, head_dim//2)
+    freqs_cis_reshaped = freqs_cis.view(1, 1, *freqs_cis.shape)
+    
+    # Apply rotation
+    q_rot = torch.view_as_real(q_complex * freqs_cis_reshaped).flatten(-2)
+    k_rot = torch.view_as_real(k_complex * freqs_cis_reshaped).flatten(-2)
+    
+    return q_rot.type_as(q), k_rot.type_as(k)
+
+
+def compute_2d_rope_freqs(H, W, head_dim, theta=10000.0):
+    """
+    Compute 2D rotary positional embedding frequencies.
+    
+    Args:
+        H: Height of spatial grid
+        W: Width of spatial grid
+        head_dim: Dimension of each attention head
+        theta: Base frequency parameter
+    
+    Returns:
+        freqs_cis: Frequency tensor of shape (H*W, head_dim//2) as complex numbers
+    """
+    assert head_dim % 4 == 0, "head_dim must be divisible by 4 for 2D RoPE"
+    
+    # Create position indices
+    y_pos = torch.arange(H, dtype=torch.float32)
+    x_pos = torch.arange(W, dtype=torch.float32)
+    y_pos, x_pos = torch.meshgrid(y_pos, x_pos, indexing='ij')
+    y_pos = y_pos.flatten()  # (H*W,)
+    x_pos = x_pos.flatten()  # (H*W,)
+    
+    # Create frequency bands (half for x, half for y)
+    dim_t = torch.arange(head_dim // 4, dtype=torch.float32)
+    dim_t = theta ** (2 * dim_t / (head_dim // 2))
+    
+    # Compute frequencies for x and y
+    freqs_x = x_pos[:, None] / dim_t[None, :]  # (H*W, head_dim//4)
+    freqs_y = y_pos[:, None] / dim_t[None, :]  # (H*W, head_dim//4)
+    
+    # Convert to complex exponential form
+    freqs_cis_x = torch.polar(torch.ones_like(freqs_x), freqs_x)  # (H*W, head_dim//4)
+    freqs_cis_y = torch.polar(torch.ones_like(freqs_y), freqs_y)  # (H*W, head_dim//4)
+    
+    # Concatenate x and y frequencies: (H*W, head_dim//2) as complex numbers
+    freqs_cis = torch.cat([freqs_cis_x, freqs_cis_y], dim=-1)
+    
+    return freqs_cis
+
+
+class AttentionRoPE(nn.Module):
+    """
+    Attention module with 2D Rotary Positional Embedding (RoPE).
+    
+    Implements rotary positional encoding for 2D spatial positions.
+    RoPE applies rotations to query and key vectors based on their spatial positions.
+    
+    Args:
+        dim (int): The input tensor dimension.
+        num_heads (int): The number of attention heads.
+        attn_ratio (float): The ratio of the attention key dimension to the head dimension.
+        rope_theta (float): Base frequency parameter for RoPE (default: 10000.0).
+    """
+
+    def __init__(self, dim, num_heads=8, attn_ratio=0.5, rope_theta=10000.0):
+        """Initializes multi-head attention module with rotary positional embedding."""
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.key_dim = int(self.head_dim * attn_ratio)
+        self.scale = self.key_dim**-0.5
+        self.rope_theta = rope_theta
+        nh_kd = self.key_dim * num_heads
+        h = dim + nh_kd * 2
+        self.qkv = Conv(dim, h, 1, act=False)
+        self.proj = Conv(dim, dim, 1, act=False)
+        # RoPE frequencies will be computed dynamically
+        self.freqs_cis_cache = {}
+        self.current_size = None
+
+    def _get_rope_freqs(self, H, W, device):
+        """Get or compute RoPE frequencies for given spatial size."""
+        cache_key = (H, W)
+        if cache_key not in self.freqs_cis_cache:
+            freqs_cis = compute_2d_rope_freqs(H, W, self.head_dim, self.rope_theta)
+            self.freqs_cis_cache[cache_key] = freqs_cis.to(device)
+        else:
+            self.freqs_cis_cache[cache_key] = self.freqs_cis_cache[cache_key].to(device)
+        return self.freqs_cis_cache[cache_key]
+
+    def forward(self, x):
+        """
+        Forward pass of the Attention module with rotary positional embedding.
+        
+        Args:
+            x (torch.Tensor): The input tensor with shape (B, C, H, W).
+        
+        Returns:
+            (torch.Tensor): The output tensor after self-attention.
+        """
+        B, C, H, W = x.shape
+        N = H * W
+        qkv = self.qkv(x)
+        q, k, v = qkv.view(B, self.num_heads, self.key_dim * 2 + self.head_dim, N).split(
+            [self.key_dim, self.key_dim, self.head_dim], dim=2
+        )
+
+        # Apply RoPE to query and key
+        freqs_cis = self._get_rope_freqs(H, W, x.device)  # (N, head_dim)
+        # Reshape q, k to (B, num_heads, N, head_dim) for RoPE
+        q_reshaped = q.transpose(-2, -1)  # (B, num_heads, N, key_dim)
+        k_reshaped = k.transpose(-2, -1)  # (B, num_heads, N, key_dim)
+        
+        # For RoPE, we need to handle key_dim vs head_dim
+        # Apply RoPE to first head_dim dimensions
+        q_rope = q_reshaped[..., :self.head_dim]
+        k_rope = k_reshaped[..., :self.head_dim]
+        
+        q_rot, k_rot = apply_rotary_pos_emb_2d(q_rope, k_rope, freqs_cis)
+        
+        # Concatenate rotated and non-rotated parts if key_dim > head_dim
+        if self.key_dim > self.head_dim:
+            q_rot = torch.cat([q_rot, q_reshaped[..., self.head_dim:]], dim=-1)
+            k_rot = torch.cat([k_rot, k_reshaped[..., self.head_dim:]], dim=-1)
+        
+        q = q_rot.transpose(-2, -1)  # Back to (B, num_heads, key_dim, N)
+        k = k_rot.transpose(-2, -1)  # Back to (B, num_heads, key_dim, N)
+
+        attn = (q.transpose(-2, -1) @ k) * self.scale
+        attn = attn.softmax(dim=-1)
+        x = (v @ attn.transpose(-2, -1)).view(B, C, H, W)
+        x = self.proj(x)
+        return x
+
+
 class PSABlock(nn.Module):
     """
     PSABlock class implementing a Position-Sensitive Attention block for neural networks.
@@ -990,7 +1322,7 @@ class PSA(nn.Module):
         self.cv1 = Conv(c1, 2 * self.c, 1, 1)
         self.cv2 = Conv(2 * self.c, c1, 1)
 
-        self.attn = Attention(self.c, attn_ratio=0.5, num_heads=self.c // 64)
+        self.attn = Attention(self.c, attn_ratio=0.5, num_heads=max(1, self.c // 64))
         self.ffn = nn.Sequential(Conv(self.c, self.c * 2, 1), Conv(self.c * 2, self.c, 1, act=False))
 
     def forward(self, x):
@@ -1034,7 +1366,7 @@ class C2PSA(nn.Module):
         self.cv1 = Conv(c1, 2 * self.c, 1, 1)
         self.cv2 = Conv(2 * self.c, c1, 1)
 
-        self.m = nn.Sequential(*(PSABlock(self.c, attn_ratio=0.5, num_heads=self.c // 64) for _ in range(n)))
+        self.m = nn.Sequential(*(PSABlock(self.c, attn_ratio=0.5, num_heads=max(1, self.c // 64)) for _ in range(n)))
 
     def forward(self, x):
         """Processes the input tensor 'x' through a series of PSA blocks and returns the transformed tensor."""
@@ -1072,7 +1404,7 @@ class C2fPSA(C2f):
         """Initializes the C2fPSA module, a variant of C2f with PSA blocks for enhanced feature extraction."""
         assert c1 == c2
         super().__init__(c1, c2, n=n, e=e)
-        self.m = nn.ModuleList(PSABlock(self.c, attn_ratio=0.5, num_heads=self.c // 64) for _ in range(n))
+        self.m = nn.ModuleList(PSABlock(self.c, attn_ratio=0.5, num_heads=max(1, self.c // 64)) for _ in range(n))
 
 
 class SCDown(nn.Module):

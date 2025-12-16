@@ -1007,6 +1007,12 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
                     max(round(min(args[2], max_channels // 2 // 32)) * width, 1) if args[2] > 1 else args[2]
                 )  # num heads
 
+            # For C2PSA, PSA, and C2fPSA, ensure c1 == c2 (required by their __init__)
+            # Use the actual input channels (ch[f]) which may come from Concat, then match c2 to c1
+            if m in {C2PSA, PSA, C2fPSA}:
+                c1 = ch[f]  # Use actual input channels (handles Concat correctly)
+                c2 = c1  # Match output channels to input channels
+
             args = [c1, c2, *args[1:]]
             if m in {
                 BottleneckCSP,

@@ -1,0 +1,9 @@
+ffmpeg -y -ss 0.350 -to 191.650 -i fc5hd60.mkv -c copy fc5_sections/01_HANDGUNS_0.35-191.65.mp4
+ffmpeg -y -ss 192.350 -to 382.650 -i fc5hd60.mkv -c copy fc5_sections/02_SHOTGUNS_192.35-382.65.mp4
+ffmpeg -y -ss 383.350 -to 565.650 -i fc5hd60.mkv -c copy fc5_sections/03_SMGS_383.35-565.65.mp4
+ffmpeg -y -ss 566.350 -to 769.650 -i fc5hd60.mkv -c copy fc5_sections/04_RIFLES_566.35-769.65.mp4
+ffmpeg -y -ss 770.350 -to 885.650 -i fc5hd60.mkv -c copy fc5_sections/05_SNIPER_RIFLES_770.35-885.65.mp4
+ffmpeg -y -ss 886.350 -to 1018.650 -i fc5hd60.mkv -c copy fc5_sections/06_LMGS_886.35-1018.65.mp4
+ffmpeg -y -ss 1019.350 -to 1156.650 -i fc5hd60.mkv -c copy fc5_sections/07_LAUNCHERS_1019.35-1156.65.mp4
+ffmpeg -y -ss 1157.350 -to 1297.650 -i fc5hd60.mkv -c copy fc5_sections/08_ALIEN_WEAPONS_1157.35-1297.65.mp4
+ffmpeg -y -ss 1298.350 -to 1411.746 -i fc5hd60.mkv -c copy fc5_sections/09_OTHER_1298.35-1411.75.mp4

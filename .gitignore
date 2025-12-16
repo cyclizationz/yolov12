@@ -1,1 +1,60 @@
 *__pycache__/
+
+# Local outputs / artifacts (do not commit)
+outputs/
+deployment/outputs/
+
+# Videos (large artifacts)
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.webm
+*.flv
+*.m4v
+
+# Build / IDE / cache artifacts
+build/
+deployment/build/
+.vscode/
+**/.cmake/
+**/CMakeFiles/
+**/CMakeCache.txt
+**/cmake_install.cmake
+**/Makefile
+**/*.o
+**/*.obj
+**/*.a
+**/*.so
+**/*.dylib
+**/*.dll
+
+# Training outputs / python packaging
+runs/
+**/*.egg-info/
+
+# Large model artifacts
+*.pt
+*.pth
+*.whl
+
+# Docs/binaries often large
+*.pdf
+
+# Deployment bundles / models (download locally)
+deployment/onnxruntime-*/
+deployment/*.onnx
+
+# Local experiment templates (generated/symlinks)
+deployment/pixel_kinds_templates/
+
+# Large modification artifacts
+modification/*.engine
+modification/*.onnx
+modification/*.onnx.data
+modification/*openvino_model/
+modification/*openvino_model/**
+
+# Office docs / temp locks
+*.docx
+**/.~lock.*
