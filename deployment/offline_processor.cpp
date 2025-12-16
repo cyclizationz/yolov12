@@ -978,6 +978,7 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
         cv::Size wh{};
         std::array<float, 32> emb_norm{};
         std::string path; // saved RGBA template path
+        uint64_t use_count{0}; // how many times selected for this run (server-side)
     };
     std::vector<LatentTpl> latent_bank;
     std::unordered_map<uint32_t, size_t> latent_id_to_index;
@@ -998,6 +999,15 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
         bool valid{false};
     };
     std::unordered_map<int, LastClientTpl> last_client_tpl_by_class;
+
+    // Latent-key stats (server-side selection)
+    uint64_t latent_minted = 0;
+    uint64_t latent_reused = 0;
+    uint64_t latent_forced_mints = 0;
+    uint64_t latent_motion_boost_mints = 0;
+    uint64_t latent_periodic_skipped = 0;
+    uint64_t latent_motion_boost_events = 0;
+    std::vector<float> latent_reuse_cos_sims;
     
     int frameIdx = 0;
     cv::Mat frame;
@@ -1125,6 +1135,7 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                         float ad = area_ratio_delta(itLastBox->second.box, safeBox);
                         if (iou < opt.latentMotionIouThr || cdist > opt.latentMotionCenterPx || ad > opt.latentMotionScaleThr) {
                             latent_boost_until_frame[d.classId] = frameIdx + std::max(0, opt.latentMotionBoostFrames);
+                            latent_motion_boost_events++;
                         }
                     }
                     auto itBoost = latent_boost_until_frame.find(d.classId);
@@ -1143,14 +1154,15 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                             float sim = cosine_sim_32(emb, itLast->second.emb_norm);
                             if (sim >= (opt.latentCosineThreshold - 0.01f)) {
                                 chosen_id = itLast->second.id;
+                                latent_reuse_cos_sims.push_back(sim);
                             }
                         }
                     }
 
                     // Global search if no temporal reuse
-                    if (chosen_id == 0 && !force_mint) {
-                        float bestSim = -1.0f;
-                        uint32_t bestId = 0;
+                    float bestSim = -1.0f;
+                    uint32_t bestId = 0;
+                    if (chosen_id == 0) {
                         for (const auto &tpl : latent_bank) {
                             if (tpl.cls != d.classId) continue;
                             if (std::abs(tpl.wh.width - safeBox.width) > 2 || std::abs(tpl.wh.height - safeBox.height) > 2) continue;
@@ -1160,9 +1172,19 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                                 bestId = tpl.id;
                             }
                         }
+                    }
+                    if (chosen_id == 0 && !force_mint) {
                         if (bestId != 0 && bestSim >= opt.latentCosineThreshold) {
                             chosen_id = bestId;
+                            latent_reuse_cos_sims.push_back(bestSim);
                         }
+                    }
+                    // Efficiency: on periodic forced mint, skip mint if bestSim is extremely high.
+                    if (force_mint && bestId != 0 && bestSim >= opt.latentPeriodSkipThr) {
+                        chosen_id = bestId;
+                        force_mint = false;
+                        latent_periodic_skipped++;
+                        latent_reuse_cos_sims.push_back(bestSim);
                     }
 
                     if (chosen_id == 0 || force_mint) {
@@ -1180,10 +1202,24 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                         tpl.wh = safeBox.size();
                         tpl.emb_norm = emb;
                         tpl.path = out_png.string();
+                        tpl.use_count = 1;
                         latent_id_to_index[tpl.id] = latent_bank.size();
                         latent_bank.push_back(std::move(tpl));
+                        latent_minted++;
+                        if (force_mint) {
+                            latent_forced_mints++;
+                            auto itB = latent_boost_until_frame.find(d.classId);
+                            if (itB != latent_boost_until_frame.end() && frameIdx < itB->second) {
+                                latent_motion_boost_mints++;
+                            }
+                        }
                     } else {
                         matched_occurrences++;
+                        latent_reused++;
+                        auto itIdx2 = latent_id_to_index.find(chosen_id);
+                        if (itIdx2 != latent_id_to_index.end()) {
+                            latent_bank[itIdx2->second].use_count++;
+                        }
                     }
 
                     det_tplids[di] = chosen_id;
@@ -1466,6 +1502,51 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
         report["latent_motion_center_px"] = opt.latentMotionCenterPx;
         report["latent_motion_scale_thr"] = opt.latentMotionScaleThr;
         report["latent_motion_boost_frames"] = opt.latentMotionBoostFrames;
+
+        report["latent_minted"] = latent_minted;
+        report["latent_reused"] = latent_reused;
+        report["latent_forced_mints"] = latent_forced_mints;
+        report["latent_motion_boost_mints"] = latent_motion_boost_mints;
+        report["latent_periodic_skipped"] = latent_periodic_skipped;
+        report["latent_motion_boost_events"] = latent_motion_boost_events;
+        report["latent_period_skip_thr"] = opt.latentPeriodSkipThr;
+        report["latent_reuse_ratio"] = (latent_minted + latent_reused) ? (double)latent_reused / (double)(latent_minted + latent_reused) : 0.0;
+
+        if (!latent_reuse_cos_sims.empty()) {
+            std::sort(latent_reuse_cos_sims.begin(), latent_reuse_cos_sims.end());
+            auto q = [&](double p){
+                size_t n = latent_reuse_cos_sims.size();
+                size_t i = (size_t)std::min<double>(n - 1, std::max<double>(0.0, p * (n - 1)));
+                return (double)latent_reuse_cos_sims[i];
+            };
+            report["latent_reuse_cosine_quantiles"] = {
+                {"p01", q(0.01)}, {"p05", q(0.05)}, {"p10", q(0.10)},
+                {"p50", q(0.50)}, {"p90", q(0.90)}, {"p95", q(0.95)}, {"p99", q(0.99)}
+            };
+        }
+
+        // Dump full latent bank (for heatmaps/clustering)
+        try {
+            json bank = json::array();
+            for (const auto &t : latent_bank) {
+                json e = json::array();
+                for (int i = 0; i < 32; ++i) e.push_back(t.emb_norm[(size_t)i]);
+                bank.push_back({
+                    {"id", t.id},
+                    {"cls", t.cls},
+                    {"w", t.wh.width},
+                    {"h", t.wh.height},
+                    {"use_count", t.use_count},
+                    {"path", t.path},
+                    {"emb", e}
+                });
+            }
+            std::ofstream bf(fs::path(opt.outDir) / "latent_bank.json");
+            bf << bank.dump(2);
+            report["latent_bank_path"] = (fs::path(opt.outDir) / "latent_bank.json").string();
+        } catch (...) {
+            // ignore
+        }
     }
     report["latents_dump_enabled"] = opt.dumpLatents;
     if (opt.dumpLatents) {

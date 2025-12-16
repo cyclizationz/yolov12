@@ -97,6 +97,11 @@ def main():
     # 3) Aggregate over windows of 10 frames to reduce noise
     window = int(args.window)
 
+    # Mean saving ratio over all frames (not windowed)
+    base_arr_full = np.array(baseline_bytes, dtype=np.float64)
+    mask_arr_full = np.array(masked_bytes, dtype=np.float64)
+    mean_saving = float((base_arr_full.mean() - mask_arr_full.mean()) / max(base_arr_full.mean(), 1e-9))
+
     def window_avg(seq, w):
         out = []
         for i in range(0, len(seq), w):
@@ -153,7 +158,7 @@ def main():
     # 4a) Bandwidth figure (lines only) + highlight top-5 groups
     fig1, ax1 = plt.subplots(figsize=(12, 6))
     ax1.plot(groups, baseline_avg, label=f"Baseline bytes/frame (avg{window})", color="tab:blue")
-    ax1.plot(groups, masked_avg, label=f"Masked bytes/frame (avg{window})", color="tab:orange")
+    ax1.plot(groups, masked_avg, label=f"Masked bytes/frame (avg{window}); mean saving={mean_saving*100:.2f}%", color="tab:orange")
 
     # Mark top-5 saving groups on masked curve
     ax1.scatter(top_k, masked_arr[top_k], color="black", marker="o", zorder=5, label="Top-5 savings")
@@ -162,7 +167,7 @@ def main():
     ax1.set_ylabel(f"bytes per frame ({window}-frame average)")
     ax1.grid(True, which="both", axis="both", linestyle="--", alpha=0.3)
     ax1.legend(loc="upper right")
-    plt.title(f"Bandwidth ({window}-frame Averages) – Racing Video")
+    plt.title(f"Bandwidth ({window}-frame Averages) – mean saving={mean_saving*100:.2f}%")
     plt.tight_layout()
     suffix = f"_{args.tag}" if args.tag else ""
     out_band = out_dir / f"bandwidth{suffix}.png"

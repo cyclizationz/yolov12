@@ -29,6 +29,7 @@ void print_usage(const char* program_name) {
               << "  --latent-key            YOLO offline sim: assign template_id by maskCoeff embedding (no client hashing)\n"
               << "  --latent-thr <float>    Cosine similarity threshold for template reuse (default: 0.95)\n"
               << "  --latent-period <int>   Base sampling period (default: 2 => ~50% templates)\n"
+              << "  --latent-period-skip <f> Skip periodic mint if best cosine >= this (default: 0.9999)\n"
               << "  --latent-motion-iou <f> Motion trigger IoU threshold (default: 0.6)\n"
               << "  --latent-motion-center <f> Motion trigger center shift in px (default: 20)\n"
               << "  --latent-motion-scale <f> Motion trigger area ratio delta (default: 0.25)\n"
@@ -52,6 +53,7 @@ int main(int argc, char* argv[]) {
         {"latent-key", no_argument, 0, 'L'},
         {"latent-thr", required_argument, 0, 'Z'},
         {"latent-period", required_argument, 0, 'P'},
+        {"latent-period-skip", required_argument, 0, 'K'},
         {"latent-motion-iou", required_argument, 0, 'I'},
         {"latent-motion-center", required_argument, 0, 'O'},
         {"latent-motion-scale", required_argument, 0, 'S'},
@@ -111,6 +113,9 @@ int main(int argc, char* argv[]) {
                 break;
             case 'P':
                 opt.latentSamplePeriod = std::stoi(optarg);
+                break;
+            case 'K':
+                opt.latentPeriodSkipThr = std::stof(optarg);
                 break;
             case 'I':
                 opt.latentMotionIouThr = std::stof(optarg);
