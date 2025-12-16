@@ -29,6 +29,10 @@ struct OfflineOptions {
     bool recordTiming = false; // Record per-frame timing stats into report.json (no extra printing)
     bool yoloLatentKey = false; // YOLO offline simulator: assign template_id via maskCoeff embedding, no hashing on client
     float latentCosineThreshold = 0.95f; // cosine similarity threshold to reuse template_id
+
+    // Experiment support: dump per-frame latent embeddings to analyze similarity/thresholds offline.
+    bool dumpLatents = false;
+    std::string latentsOutPath = ""; // defaults to <outDir>/latents.jsonl when enabled
 };
 
 struct DictItem {

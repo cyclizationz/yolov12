@@ -28,6 +28,7 @@ void print_usage(const char* program_name) {
               << "  --timing                Record per-frame timing stats into report.json\n"
               << "  --latent-key            YOLO offline sim: assign template_id by maskCoeff embedding (no client hashing)\n"
               << "  --latent-thr <float>    Cosine similarity threshold for template reuse (default: 0.95)\n"
+              << "  --dump-latents[=PATH]   Dump per-frame latent embeddings to JSONL (default: <outDir>/latents.jsonl)\n"
               << "  --cpu                   Force CPU inference (explicit flag)\n"
               << "  -h                      Show this help message\n";
 }
@@ -45,6 +46,7 @@ int main(int argc, char* argv[]) {
         {"timing", no_argument, 0, 'R'},
         {"latent-key", no_argument, 0, 'L'},
         {"latent-thr", required_argument, 0, 'Z'},
+        {"dump-latents", optional_argument, 0, 'D'},
         {0, 0, 0, 0}
     };
 
@@ -96,6 +98,10 @@ int main(int argc, char* argv[]) {
                 break;
             case 'Z':
                 opt.latentCosineThreshold = std::stof(optarg);
+                break;
+            case 'D':
+                opt.dumpLatents = true;
+                if (optarg) opt.latentsOutPath = optarg;
                 break;
             case 'h':
                 print_usage(argv[0]);

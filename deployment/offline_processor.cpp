@@ -930,6 +930,18 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
     // Timing (optional, stored in report.json; no extra printing)
     std::vector<double> t_infer_ms, t_dict_ms, t_paint_ms, t_recover_ms, t_total_ms;
 
+    // Optional latent dump (for threshold sweep experiments)
+    std::ofstream latOut;
+    if (opt.dumpLatents) {
+        std::string path = opt.latentsOutPath.empty()
+            ? (fs::path(opt.outDir) / "latents.jsonl").string()
+            : opt.latentsOutPath;
+        latOut.open(path, std::ios::out);
+        if (!latOut.is_open()) {
+            std::cerr << "Warning: could not open latents dump: " << path << std::endl;
+        }
+    }
+
     // Simple temporal stabilization for YOLO template selection: keep last chosen template per class
     // if the bbox is highly overlapping (reduces flashing).
     struct LastTpl {
@@ -985,6 +997,28 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
             }
             auto t1 = std::chrono::steady_clock::now();
             infer_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        }
+
+        // Dump raw per-frame latent embeddings (YOLO only; independent of the reuse threshold).
+        // This lets us sweep thresholds offline without rerunning inference.
+        if (opt.dumpLatents && latOut.is_open() && !opt.pixelMode) {
+            for (const auto &d : dets) {
+                if (d.confidence < opt.confThreshold) continue;
+                if (d.boxMask.empty()) continue;
+                auto emb = l2_normalize_32(d.maskCoeff);
+                // JSONL: one detection per line
+                latOut << "{\"frame\":" << frameIdx
+                       << ",\"cls\":" << d.classId
+                       << ",\"conf\":" << d.confidence
+                       << ",\"x\":" << d.box.x << ",\"y\":" << d.box.y
+                       << ",\"w\":" << d.box.width << ",\"h\":" << d.box.height
+                       << ",\"emb\":[";
+                for (int i = 0; i < 32; ++i) {
+                    if (i) latOut << ",";
+                    latOut << emb[(size_t)i];
+                }
+                latOut << "]}\n";
+            }
         }
 
         std::vector<SEIRegion> sei_regions;
@@ -1354,6 +1388,12 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
     if (opt.yoloLatentKey) {
         report["latent_bank_size"] = (uint64_t)latent_bank.size();
         report["latent_cosine_threshold"] = opt.latentCosineThreshold;
+    }
+    report["latents_dump_enabled"] = opt.dumpLatents;
+    if (opt.dumpLatents) {
+        report["latents_dump_path"] = opt.latentsOutPath.empty()
+            ? (fs::path(opt.outDir) / "latents.jsonl").string()
+            : opt.latentsOutPath;
     }
     if (opt.recordTiming && !t_total_ms.empty()) {
         auto avg = [](const std::vector<double> &v){
