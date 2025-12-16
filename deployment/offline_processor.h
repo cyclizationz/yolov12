@@ -35,6 +35,7 @@ struct OfflineOptions {
     // - If motion is significant, mint every frame for `latentMotionBoostFrames` frames.
     int latentSamplePeriod = 2;          // base sampling period (frames)
     float latentPeriodSkipThr = 0.9999f; // if periodic mint but bestSim >= this, skip mint (avoid redundant templates)
+    float latentMergeThr = 0.999998f;    // if minting, merge into existing template if bestSim >= this (compaction)
     float latentMotionIouThr = 0.6f;     // trigger boost if IoU(last_box, cur_box) < this
     float latentMotionCenterPx = 20.0f;  // trigger boost if center shift (px) > this
     float latentMotionScaleThr = 0.25f;  // trigger boost if area ratio differs by > this (e.g. 0.25 => 25%)

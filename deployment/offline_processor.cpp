@@ -1007,7 +1007,12 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
     uint64_t latent_motion_boost_mints = 0;
     uint64_t latent_periodic_skipped = 0;
     uint64_t latent_motion_boost_events = 0;
+    uint64_t latent_merged_mints = 0; // number of would-be mints merged into an existing template
     std::vector<float> latent_reuse_cos_sims;
+
+    // Latent matching cost breakdown
+    double latent_search_ms_sum = 0.0;   // bank scanning cost
+    double latent_mint_io_ms_sum = 0.0;  // imwrite cost for newly minted templates
     
     int frameIdx = 0;
     cv::Mat frame;
@@ -1159,10 +1164,13 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                         }
                     }
 
-                    // Global search if no temporal reuse
+                    // Global search:
+                    // - needed when no chosen_id (normal reuse)
+                    // - ALSO needed when force_mint is active so we can decide to skip/merge redundant mints.
                     float bestSim = -1.0f;
                     uint32_t bestId = 0;
-                    if (chosen_id == 0) {
+                    if (chosen_id == 0 || force_mint) {
+                        auto t_search0 = std::chrono::steady_clock::now();
                         for (const auto &tpl : latent_bank) {
                             if (tpl.cls != d.classId) continue;
                             if (std::abs(tpl.wh.width - safeBox.width) > 2 || std::abs(tpl.wh.height - safeBox.height) > 2) continue;
@@ -1172,6 +1180,8 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                                 bestId = tpl.id;
                             }
                         }
+                        auto t_search1 = std::chrono::steady_clock::now();
+                        latent_search_ms_sum += std::chrono::duration<double, std::milli>(t_search1 - t_search0).count();
                     }
                     if (chosen_id == 0 && !force_mint) {
                         if (bestId != 0 && bestSim >= opt.latentCosineThreshold) {
@@ -1187,6 +1197,14 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                         latent_reuse_cos_sims.push_back(bestSim);
                     }
 
+                    // Compaction: if we are about to mint, but bestSim is extremely high, merge into bestId.
+                    if ((chosen_id == 0 || force_mint) && bestId != 0 && bestSim >= opt.latentMergeThr) {
+                        chosen_id = bestId;
+                        force_mint = false;
+                        latent_merged_mints++;
+                        latent_reuse_cos_sims.push_back(bestSim);
+                    }
+
                     if (chosen_id == 0 || force_mint) {
                         // Mint new template_id and save RGBA template
                         chosen_id = next_template_id++;
@@ -1194,7 +1212,12 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
 
                         cv::Mat rgba = OfflineProcessor::extract_object_rgba(frame, d.boxMask, safeBox);
                         fs::path out_png = fs::path(opt.dictDir) / (std::to_string(chosen_id) + ".png");
-                        try { cv::imwrite(out_png.string(), rgba); } catch (...) {}
+                        {
+                            auto t_io0 = std::chrono::steady_clock::now();
+                            try { cv::imwrite(out_png.string(), rgba); } catch (...) {}
+                            auto t_io1 = std::chrono::steady_clock::now();
+                            latent_mint_io_ms_sum += std::chrono::duration<double, std::milli>(t_io1 - t_io0).count();
+                        }
 
                         LatentTpl tpl;
                         tpl.id = chosen_id;
@@ -1510,7 +1533,11 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
         report["latent_periodic_skipped"] = latent_periodic_skipped;
         report["latent_motion_boost_events"] = latent_motion_boost_events;
         report["latent_period_skip_thr"] = opt.latentPeriodSkipThr;
+        report["latent_merge_thr"] = opt.latentMergeThr;
+        report["latent_merged_mints"] = latent_merged_mints;
         report["latent_reuse_ratio"] = (latent_minted + latent_reused) ? (double)latent_reused / (double)(latent_minted + latent_reused) : 0.0;
+        report["latent_avg_search_ms_per_det"] = (double)(latent_search_ms_sum / std::max<uint64_t>(1, total_occurrences));
+        report["latent_avg_mint_io_ms_per_mint"] = (double)(latent_mint_io_ms_sum / std::max<uint64_t>(1, latent_minted));
 
         if (!latent_reuse_cos_sims.empty()) {
             std::sort(latent_reuse_cos_sims.begin(), latent_reuse_cos_sims.end());
