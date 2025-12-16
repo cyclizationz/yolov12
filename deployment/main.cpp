@@ -31,6 +31,10 @@ void print_usage(const char* program_name) {
               << "  --pixel-band-pad-y <px> Pixel: vertical band pad for multi-peak scan (default: 20)\n"
               << "  --pixel-max-peaks <n>   Pixel: max detections per frame in band scan (default: 30)\n"
               << "  --pixel-peak-nms <px>   Pixel: suppression radius around a peak (default: 6)\n"
+              << "  --pixel-bands <n>       Pixel: number of horizontal bands to scan (default: 2)\n"
+              << "  --pixel-band-sep <px>   Pixel: min separation between band centers (default: 24)\n"
+              << "  --pixel-flow <0|1>      Pixel: enable sparse optical flow stabilization (default: 1)\n"
+              << "  --pixel-flow-pts <n>    Pixel: max LK points (default: 120)\n"
               << "  --yolo-class-color      YOLO mode: paint masks with class-consistent colors (instead of hash colors)\n"
               << "  --timing                Record per-frame timing stats into report.json\n"
               << "  --latent-key            YOLO offline sim: assign template_id by maskCoeff embedding (no client hashing)\n"
@@ -65,6 +69,10 @@ int main(int argc, char* argv[]) {
         {"pixel-band-pad-y", required_argument, 0, 'u'},
         {"pixel-max-peaks", required_argument, 0, 'v'},
         {"pixel-peak-nms", required_argument, 0, 'w'},
+        {"pixel-bands", required_argument, 0, 'g'},
+        {"pixel-band-sep", required_argument, 0, 'j'},
+        {"pixel-flow", required_argument, 0, 'f'},
+        {"pixel-flow-pts", required_argument, 0, 'x'},
         {"latent-key", no_argument, 0, 'L'},
         {"latent-thr", required_argument, 0, 'Z'},
         {"latent-period", required_argument, 0, 'P'},
@@ -135,6 +143,18 @@ int main(int argc, char* argv[]) {
                 break;
             case 'w':
                 opt.pixelPeakNms = std::stoi(optarg);
+                break;
+            case 'g':
+                opt.pixelNumBands = std::stoi(optarg);
+                break;
+            case 'j':
+                opt.pixelBandMinSep = std::stoi(optarg);
+                break;
+            case 'f':
+                opt.pixelUseFlow = (std::stoi(optarg) != 0);
+                break;
+            case 'x':
+                opt.pixelFlowMaxPts = std::stoi(optarg);
                 break;
             case 'Y':
                 opt.yoloClassConsistentColor = true;

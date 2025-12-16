@@ -58,6 +58,12 @@ struct OfflineOptions {
     int pixelBandPadY = 20;         // vertical pad around predicted y (px)
     int pixelMaxPeaks = 30;         // max detections per frame from band scan
     int pixelPeakNms = 6;           // suppress radius (px) around a selected peak in response map
+
+    // Pixel band selection + flow stabilization
+    int pixelNumBands = 2;          // how many horizontal bands to scan per frame
+    int pixelBandMinSep = 24;       // minimum separation between band centers (px)
+    bool pixelUseFlow = true;       // enable sparse optical flow stabilization
+    int pixelFlowMaxPts = 120;      // max points for LK flow
 };
 
 struct DictItem {

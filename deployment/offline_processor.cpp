@@ -504,6 +504,7 @@ struct PixelTracker {
 
     // Kalman: state [cx, cy, vx, vy], measurement [cx, cy]
     cv::KalmanFilter kf;
+    cv::Mat prev_gray;
 
     static float color_score_mean_bgr(const cv::Mat &tpl_bgr, const cv::Mat &roi_bgr) {
         if (tpl_bgr.empty() || roi_bgr.empty()) return 0.0f;
@@ -517,6 +518,71 @@ struct PixelTracker {
         // sigma tuned for 8-bit BGR space (larger sigma => less penalty)
         double sigma = 80.0;
         return (float)std::exp(-dist / sigma);
+    }
+
+    // Row-energy band selection: find top-N peaks in per-row edge density.
+    static void select_bands_from_edges(const cv::Mat &edges, int numBands, int minSep,
+                                        std::vector<int> &outY, double &row_ms) {
+        auto t0 = std::chrono::steady_clock::now();
+        outY.clear();
+        if (edges.empty()) { row_ms = 0.0; return; }
+        numBands = std::max(1, numBands);
+        minSep = std::max(1, minSep);
+
+        // Row energy = fraction of edge pixels in that row
+        std::vector<float> energy(edges.rows, 0.0f);
+        for (int y = 0; y < edges.rows; ++y) {
+            const uchar *p = edges.ptr<uchar>(y);
+            int cnt = 0;
+            for (int x = 0; x < edges.cols; ++x) cnt += (p[x] != 0);
+            energy[y] = (float)cnt / (float)std::max(1, edges.cols);
+        }
+
+        // Simple peak picking: repeatedly take max, then suppress +-minSep
+        std::vector<float> work = energy;
+        for (int i = 0; i < numBands; ++i) {
+            int bestY = -1;
+            float bestV = 0.0f;
+            for (int y = 0; y < (int)work.size(); ++y) {
+                if (work[y] > bestV) { bestV = work[y]; bestY = y; }
+            }
+            if (bestY < 0 || bestV <= 1e-6f) break;
+            outY.push_back(bestY);
+            int y0 = std::max(0, bestY - minSep);
+            int y1 = std::min((int)work.size(), bestY + minSep + 1);
+            for (int y = y0; y < y1; ++y) work[y] = 0.0f;
+        }
+
+        auto t1 = std::chrono::steady_clock::now();
+        row_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    }
+
+    // Sparse optical flow: estimate global vertical shift (dy) between prev_gray and cur_gray.
+    static bool estimate_flow_dy(const cv::Mat &prev_gray, const cv::Mat &cur_gray,
+                                int maxPts, float &outDy, double &flow_ms) {
+        auto t0 = std::chrono::steady_clock::now();
+        outDy = 0.0f;
+        if (prev_gray.empty() || cur_gray.empty()) { flow_ms = 0.0; return false; }
+        std::vector<cv::Point2f> p0;
+        cv::goodFeaturesToTrack(prev_gray, p0, std::max(10, maxPts), 0.01, 8);
+        if (p0.empty()) { flow_ms = 0.0; return false; }
+        std::vector<cv::Point2f> p1;
+        std::vector<uchar> status;
+        std::vector<float> err;
+        cv::calcOpticalFlowPyrLK(prev_gray, cur_gray, p0, p1, status, err,
+                                 cv::Size(21, 21), 3);
+        std::vector<float> dys;
+        dys.reserve(p0.size());
+        for (size_t i = 0; i < p0.size(); ++i) {
+            if (!status[i]) continue;
+            dys.push_back(p1[i].y - p0[i].y);
+        }
+        if (dys.size() < 8) { flow_ms = 0.0; return false; }
+        std::nth_element(dys.begin(), dys.begin() + dys.size() / 2, dys.end());
+        outDy = dys[dys.size() / 2];
+        auto t1 = std::chrono::steady_clock::now();
+        flow_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        return true;
     }
 
     void reset_kf(float cx, float cy) {
@@ -723,7 +789,8 @@ struct PixelTracker {
     bool band_scan_multi(const cv::Mat &frame_bgr, const cv::Mat &frame_edges, int bestTi,
                          const OfflineOptions &opt,
                          std::vector<std::pair<cv::Rect, float>> &out,
-                         double &band_ms, int &scanned) {
+                         double &band_ms, double &row_ms, double &flow_ms, int &bands_used,
+                         int &scanned) {
         auto t0 = std::chrono::steady_clock::now();
         out.clear();
         scanned = 0;
@@ -752,70 +819,70 @@ struct PixelTracker {
             return false;
         }
 
-        // Predict y center
-        cv::Mat pred = kf.predict();
-        float pcy = pred.at<float>(1);
+        // Determine band centers: row-energy peaks (N bands). Optionally shift by optical flow dy.
+        std::vector<int> bandYs;
+        select_bands_from_edges(frame_edges, opt.pixelNumBands, opt.pixelBandMinSep, bandYs, row_ms);
+        bands_used = (int)bandYs.size();
+
+        float dy = 0.0f;
+        if (opt.pixelUseFlow && !prev_gray.empty()) {
+            cv::Mat cur_gray;
+            cv::cvtColor(frame_bgr, cur_gray, cv::COLOR_BGR2GRAY);
+            estimate_flow_dy(prev_gray, cur_gray, opt.pixelFlowMaxPts, dy, flow_ms);
+            prev_gray = cur_gray;
+        } else if (prev_gray.empty() && opt.pixelUseFlow && !frame_bgr.empty()) {
+            cv::cvtColor(frame_bgr, prev_gray, cv::COLOR_BGR2GRAY);
+        }
+
         int padY = std::max(0, opt.pixelBandPadY);
-        int y0 = (int)(pcy - th * 0.5f) - padY;
-        int y1 = (int)(pcy + th * 0.5f) + padY;
-        y0 = std::max(0, y0);
-        y1 = std::min(frame_edges.rows, y1);
-        cv::Rect band(0, y0, frame_edges.cols, std::max(0, y1 - y0));
-        if (band.height < th + 2) {
-            auto t1 = std::chrono::steady_clock::now();
-            band_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-            return false;
-        }
-
-        cv::Mat band_edges = frame_edges(band);
-        cv::Mat tmpl_rs;
-        cv::resize(tmpl.edges, tmpl_rs, cv::Size(tw, th), 0, 0, cv::INTER_AREA);
-
-        cv::Mat res;
-        cv::matchTemplate(band_edges, tmpl_rs, res, cv::TM_CCOEFF_NORMED);
-        if (res.empty()) {
-            auto t1 = std::chrono::steady_clock::now();
-            band_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-            return false;
-        }
-        scanned = 1;
-
-        // Multi-peak selection with suppression
-        cv::Mat work = res.clone();
         int maxPeaks = std::max(1, opt.pixelMaxPeaks);
         int nms = std::max(1, opt.pixelPeakNms);
 
-        for (int i = 0; i < maxPeaks; ++i) {
-            double minV, maxV;
-            cv::Point minP, maxP;
-            cv::minMaxLoc(work, &minV, &maxV, &minP, &maxP);
-            float edge = (float)maxV;
-            if (edge < opt.pixelMinScore * 0.5f) break; // too weak, stop early
+        cv::Mat tmpl_rs;
+        cv::resize(tmpl.edges, tmpl_rs, cv::Size(tw, th), 0, 0, cv::INTER_AREA);
 
-            cv::Rect patch(band.x + maxP.x, band.y + maxP.y, tw, th);
-            patch = clamp_rect(patch, frame_edges.size());
-            if (patch.width != tw || patch.height != th) {
-                // suppress and continue
-            } else {
-                // color score
-                float cscore = 0.0f;
-                if (!frame_bgr.empty()) {
-                    cv::Mat tpl_bgr_rs;
-                    cv::resize(tmpl.bgr, tpl_bgr_rs, cv::Size(tw, th), 0, 0, cv::INTER_NEAREST);
-                    cscore = color_score_mean_bgr(tpl_bgr_rs, frame_bgr(patch));
+        for (int by : bandYs) {
+            int cy = (int)std::round((double)by + (double)dy);
+            int y0 = cy - th / 2 - padY;
+            int y1 = cy + th / 2 + padY;
+            y0 = std::max(0, y0);
+            y1 = std::min(frame_edges.rows, y1);
+            cv::Rect band(0, y0, frame_edges.cols, std::max(0, y1 - y0));
+            if (band.height < th + 2) continue;
+
+            cv::Mat band_edges = frame_edges(band);
+            cv::Mat res;
+            cv::matchTemplate(band_edges, tmpl_rs, res, cv::TM_CCOEFF_NORMED);
+            if (res.empty()) continue;
+            scanned += 1;
+
+            cv::Mat work = res.clone();
+            for (int i = 0; i < maxPeaks; ++i) {
+                double minV, maxV;
+                cv::Point minP, maxP;
+                cv::minMaxLoc(work, &minV, &maxV, &minP, &maxP);
+                float edge = (float)maxV;
+                if (edge < opt.pixelMinScore * 0.5f) break;
+
+                cv::Rect patch(band.x + maxP.x, band.y + maxP.y, tw, th);
+                patch = clamp_rect(patch, frame_edges.size());
+                if (patch.width == tw && patch.height == th) {
+                    float cscore = 0.0f;
+                    if (!frame_bgr.empty()) {
+                        cv::Mat tpl_bgr_rs;
+                        cv::resize(tmpl.bgr, tpl_bgr_rs, cv::Size(tw, th), 0, 0, cv::INTER_NEAREST);
+                        cscore = color_score_mean_bgr(tpl_bgr_rs, frame_bgr(patch));
+                    }
+                    float final = 0.7f * edge + 0.3f * cscore;
+                    if (final >= opt.pixelMinScore) out.push_back({patch, final});
                 }
-                float final = 0.7f * edge + 0.3f * cscore;
-                if (final >= opt.pixelMinScore) {
-                    out.push_back({patch, final});
-                }
+
+                int sx0 = std::max(0, maxP.x - nms);
+                int sy0 = std::max(0, maxP.y - nms);
+                int sx1 = std::min(work.cols, maxP.x + nms + 1);
+                int sy1 = std::min(work.rows, maxP.y + nms + 1);
+                work(cv::Rect(sx0, sy0, sx1 - sx0, sy1 - sy0)).setTo(0.0f);
             }
-
-            // Suppress neighborhood in response map around maxP
-            int sx0 = std::max(0, maxP.x - nms);
-            int sy0 = std::max(0, maxP.y - nms);
-            int sx1 = std::min(work.cols, maxP.x + nms + 1);
-            int sy1 = std::min(work.rows, maxP.y + nms + 1);
-            work(cv::Rect(sx0, sy0, sx1 - sx0, sy1 - sy0)).setTo(0.0f);
         }
 
         auto t1 = std::chrono::steady_clock::now();
@@ -1281,6 +1348,8 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
     // Timing (optional, stored in report.json; no extra printing)
     std::vector<double> t_infer_ms, t_dict_ms, t_paint_ms, t_recover_ms, t_total_ms;
     std::vector<double> t_pixel_bootstrap_ms, t_pixel_roi_ms, t_pixel_band_ms;
+    std::vector<double> t_pixel_row_ms, t_pixel_flow_ms;
+    std::vector<int> t_pixel_bands_used;
     std::vector<int> t_pixel_scanned_bootstrap, t_pixel_scanned_roi, t_pixel_scanned_band;
 
     // Optional latent dump (for threshold sweep experiments)
@@ -1365,6 +1434,9 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
         double pixel_bootstrap_ms = 0.0;
         double pixel_roi_ms = 0.0;
         double pixel_band_ms = 0.0;
+        double pixel_row_ms = 0.0;
+        double pixel_flow_ms = 0.0;
+        int pixel_bands_used = 0;
         int pixel_scanned_bootstrap = 0;
         int pixel_scanned_roi = 0;
         int pixel_scanned_band = 0;
@@ -1401,7 +1473,9 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
 
                         // Expand to multiple bricks: scan a narrow Y band but full width for many peaks (same template).
                         std::vector<std::pair<cv::Rect, float>> peaks;
-                        pixelTracker.band_scan_multi(frame, frame_edges, bestTi, opt, peaks, pixel_band_ms, pixel_scanned_band);
+                        pixelTracker.band_scan_multi(frame, frame_edges, bestTi, opt, peaks,
+                                                     pixel_band_ms, pixel_row_ms, pixel_flow_ms, pixel_bands_used,
+                                                     pixel_scanned_band);
 
                         if (peaks.empty()) {
                             // fallback to single detection
@@ -1872,6 +1946,9 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                 t_pixel_scanned_roi.push_back(opt.pixelMode ? pixel_scanned_roi : 0);
                 t_pixel_band_ms.push_back(opt.pixelMode ? pixel_band_ms : 0.0);
                 t_pixel_scanned_band.push_back(opt.pixelMode ? pixel_scanned_band : 0);
+                t_pixel_row_ms.push_back(opt.pixelMode ? pixel_row_ms : 0.0);
+                t_pixel_flow_ms.push_back(opt.pixelMode ? pixel_flow_ms : 0.0);
+                t_pixel_bands_used.push_back(opt.pixelMode ? pixel_bands_used : 0);
             }
         }
 
@@ -2035,6 +2112,9 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                 if (i < t_pixel_band_ms.size()) {
                     item["pixel_band_ms"] = t_pixel_band_ms[i];
                     item["pixel_scanned_band"] = t_pixel_scanned_band[i];
+                    item["pixel_row_ms"] = t_pixel_row_ms[i];
+                    item["pixel_flow_ms"] = t_pixel_flow_ms[i];
+                    item["pixel_bands_used"] = t_pixel_bands_used[i];
                 }
             }
         }
