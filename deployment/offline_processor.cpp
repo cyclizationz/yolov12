@@ -718,6 +718,110 @@ struct PixelTracker {
         roi_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         return true;
     }
+
+    // Multi-peak scan: use predicted Y band (narrow) but full width, find multiple peaks for the chosen template.
+    bool band_scan_multi(const cv::Mat &frame_bgr, const cv::Mat &frame_edges, int bestTi,
+                         const OfflineOptions &opt,
+                         std::vector<std::pair<cv::Rect, float>> &out,
+                         double &band_ms, int &scanned) {
+        auto t0 = std::chrono::steady_clock::now();
+        out.clear();
+        scanned = 0;
+        if (bestTi < 0 || bestTi >= (int)g_pixel_templates.size()) {
+            auto t1 = std::chrono::steady_clock::now();
+            band_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            return false;
+        }
+        const auto &tmpl = g_pixel_templates[(size_t)bestTi];
+        if (tmpl.edges.empty()) {
+            auto t1 = std::chrono::steady_clock::now();
+            band_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            return false;
+        }
+
+        // scale
+        double s = 1.0;
+        if (g_pixel_scales_calibrated && (size_t)bestTi < g_pixel_template_scales.size()) {
+            s = g_pixel_template_scales[(size_t)bestTi];
+        }
+        int th = (int)(tmpl.edges.rows * s);
+        int tw = (int)(tmpl.edges.cols * s);
+        if (th < 8 || tw < 8 || th >= frame_edges.rows || tw >= frame_edges.cols) {
+            auto t1 = std::chrono::steady_clock::now();
+            band_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            return false;
+        }
+
+        // Predict y center
+        cv::Mat pred = kf.predict();
+        float pcy = pred.at<float>(1);
+        int padY = std::max(0, opt.pixelBandPadY);
+        int y0 = (int)(pcy - th * 0.5f) - padY;
+        int y1 = (int)(pcy + th * 0.5f) + padY;
+        y0 = std::max(0, y0);
+        y1 = std::min(frame_edges.rows, y1);
+        cv::Rect band(0, y0, frame_edges.cols, std::max(0, y1 - y0));
+        if (band.height < th + 2) {
+            auto t1 = std::chrono::steady_clock::now();
+            band_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            return false;
+        }
+
+        cv::Mat band_edges = frame_edges(band);
+        cv::Mat tmpl_rs;
+        cv::resize(tmpl.edges, tmpl_rs, cv::Size(tw, th), 0, 0, cv::INTER_AREA);
+
+        cv::Mat res;
+        cv::matchTemplate(band_edges, tmpl_rs, res, cv::TM_CCOEFF_NORMED);
+        if (res.empty()) {
+            auto t1 = std::chrono::steady_clock::now();
+            band_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            return false;
+        }
+        scanned = 1;
+
+        // Multi-peak selection with suppression
+        cv::Mat work = res.clone();
+        int maxPeaks = std::max(1, opt.pixelMaxPeaks);
+        int nms = std::max(1, opt.pixelPeakNms);
+
+        for (int i = 0; i < maxPeaks; ++i) {
+            double minV, maxV;
+            cv::Point minP, maxP;
+            cv::minMaxLoc(work, &minV, &maxV, &minP, &maxP);
+            float edge = (float)maxV;
+            if (edge < opt.pixelMinScore * 0.5f) break; // too weak, stop early
+
+            cv::Rect patch(band.x + maxP.x, band.y + maxP.y, tw, th);
+            patch = clamp_rect(patch, frame_edges.size());
+            if (patch.width != tw || patch.height != th) {
+                // suppress and continue
+            } else {
+                // color score
+                float cscore = 0.0f;
+                if (!frame_bgr.empty()) {
+                    cv::Mat tpl_bgr_rs;
+                    cv::resize(tmpl.bgr, tpl_bgr_rs, cv::Size(tw, th), 0, 0, cv::INTER_NEAREST);
+                    cscore = color_score_mean_bgr(tpl_bgr_rs, frame_bgr(patch));
+                }
+                float final = 0.7f * edge + 0.3f * cscore;
+                if (final >= opt.pixelMinScore) {
+                    out.push_back({patch, final});
+                }
+            }
+
+            // Suppress neighborhood in response map around maxP
+            int sx0 = std::max(0, maxP.x - nms);
+            int sy0 = std::max(0, maxP.y - nms);
+            int sx1 = std::min(work.cols, maxP.x + nms + 1);
+            int sy1 = std::min(work.rows, maxP.y + nms + 1);
+            work(cv::Rect(sx0, sy0, sx1 - sx0, sy1 - sy0)).setTo(0.0f);
+        }
+
+        auto t1 = std::chrono::steady_clock::now();
+        band_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        return !out.empty();
+    }
 };
 
 
@@ -1176,8 +1280,8 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
 
     // Timing (optional, stored in report.json; no extra printing)
     std::vector<double> t_infer_ms, t_dict_ms, t_paint_ms, t_recover_ms, t_total_ms;
-    std::vector<double> t_pixel_bootstrap_ms, t_pixel_roi_ms;
-    std::vector<int> t_pixel_scanned_bootstrap, t_pixel_scanned_roi;
+    std::vector<double> t_pixel_bootstrap_ms, t_pixel_roi_ms, t_pixel_band_ms;
+    std::vector<int> t_pixel_scanned_bootstrap, t_pixel_scanned_roi, t_pixel_scanned_band;
 
     // Optional latent dump (for threshold sweep experiments)
     std::ofstream latOut;
@@ -1260,8 +1364,10 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
         std::vector<DL_RESULT> dets;
         double pixel_bootstrap_ms = 0.0;
         double pixel_roi_ms = 0.0;
+        double pixel_band_ms = 0.0;
         int pixel_scanned_bootstrap = 0;
         int pixel_scanned_roi = 0;
+        int pixel_scanned_band = 0;
         {
             auto t0 = std::chrono::steady_clock::now();
             if (opt.pixelMode) {
@@ -1293,19 +1399,34 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                     if (ok2 && score >= opt.pixelMinScore && box.area() > 0 && bestTi >= 0) {
                         pixelTracker.lostCount = 0;
 
-                        DL_RESULT d{};
-                        d.confidence = score;
-                        d.box = box;
-                        d.boxMask = cv::Mat::zeros(frame.size(), CV_8UC1);
-                        cv::rectangle(d.boxMask, box, cv::Scalar(255), cv::FILLED);
+                        // Expand to multiple bricks: scan a narrow Y band but full width for many peaks (same template).
+                        std::vector<std::pair<cv::Rect, float>> peaks;
+                        pixelTracker.band_scan_multi(frame, frame_edges, bestTi, opt, peaks, pixel_band_ms, pixel_scanned_band);
 
-                        if (bestTi >= 0 && bestTi < (int)g_pixel_templates.size()) {
+                        if (peaks.empty()) {
+                            // fallback to single detection
+                            DL_RESULT d{};
+                            d.confidence = score;
+                            d.box = box;
+                            d.boxMask = cv::Mat::zeros(frame.size(), CV_8UC1);
+                            cv::rectangle(d.boxMask, box, cv::Scalar(255), cv::FILLED);
                             const auto &tmpl = g_pixel_templates[(size_t)bestTi];
                             d.classId = tmpl.kindId;
                             d.seiPath = tmpl.relPath;
+                            dets.push_back(std::move(d));
+                        } else {
+                            for (auto &pp : peaks) {
+                                DL_RESULT d{};
+                                d.confidence = pp.second;
+                                d.box = pp.first;
+                                d.boxMask = cv::Mat::zeros(frame.size(), CV_8UC1);
+                                cv::rectangle(d.boxMask, d.box, cv::Scalar(255), cv::FILLED);
+                                const auto &tmpl = g_pixel_templates[(size_t)bestTi];
+                                d.classId = tmpl.kindId;
+                                d.seiPath = tmpl.relPath;
+                                dets.push_back(std::move(d));
+                            }
                         }
-
-                        dets.push_back(std::move(d));
                     } else {
                         pixelTracker.lostCount++;
                     }
@@ -1749,6 +1870,8 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                 t_pixel_roi_ms.push_back(opt.pixelMode ? pixel_roi_ms : 0.0);
                 t_pixel_scanned_bootstrap.push_back(opt.pixelMode ? pixel_scanned_bootstrap : 0);
                 t_pixel_scanned_roi.push_back(opt.pixelMode ? pixel_scanned_roi : 0);
+                t_pixel_band_ms.push_back(opt.pixelMode ? pixel_band_ms : 0.0);
+                t_pixel_scanned_band.push_back(opt.pixelMode ? pixel_scanned_band : 0);
             }
         }
 
@@ -1909,6 +2032,10 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                 item["pixel_roi_ms"] = t_pixel_roi_ms[i];
                 item["pixel_scanned_bootstrap"] = t_pixel_scanned_bootstrap[i];
                 item["pixel_scanned_roi"] = t_pixel_scanned_roi[i];
+                if (i < t_pixel_band_ms.size()) {
+                    item["pixel_band_ms"] = t_pixel_band_ms[i];
+                    item["pixel_scanned_band"] = t_pixel_scanned_band[i];
+                }
             }
         }
         per_frame.push_back(item);

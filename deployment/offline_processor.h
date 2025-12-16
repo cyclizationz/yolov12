@@ -53,6 +53,11 @@ struct OfflineOptions {
     int pixelRoiPad = 40;           // ROI padding around predicted box (px)
     float pixelMinScore = 0.45f;    // min combined score to accept ROI match (edge NCC + color check)
     int pixelLostMax = 5;           // re-bootstrap after N consecutive low-score frames
+
+    // Pixel multi-instance expansion: scan a narrow Y band but full width, output multiple peaks
+    int pixelBandPadY = 20;         // vertical pad around predicted y (px)
+    int pixelMaxPeaks = 30;         // max detections per frame from band scan
+    int pixelPeakNms = 6;           // suppress radius (px) around a selected peak in response map
 };
 
 struct DictItem {
