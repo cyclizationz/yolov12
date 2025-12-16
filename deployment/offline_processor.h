@@ -51,7 +51,7 @@ struct OfflineOptions {
     int pixelBootstrapInterval = 30; // frames between global re-bootstrap
     int pixelTopK = 3;              // keep top-K templates after bootstrap
     int pixelRoiPad = 40;           // ROI padding around predicted box (px)
-    float pixelMinScore = 0.65f;    // min NCC score to accept ROI match
+    float pixelMinScore = 0.45f;    // min combined score to accept ROI match (edge NCC + color check)
     int pixelLostMax = 5;           // re-bootstrap after N consecutive low-score frames
 };
 

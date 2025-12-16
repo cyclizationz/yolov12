@@ -505,6 +505,20 @@ struct PixelTracker {
     // Kalman: state [cx, cy, vx, vy], measurement [cx, cy]
     cv::KalmanFilter kf;
 
+    static float color_score_mean_bgr(const cv::Mat &tpl_bgr, const cv::Mat &roi_bgr) {
+        if (tpl_bgr.empty() || roi_bgr.empty()) return 0.0f;
+        cv::Scalar mt = cv::mean(tpl_bgr);
+        cv::Scalar mr = cv::mean(roi_bgr);
+        double db = mt[0] - mr[0];
+        double dg = mt[1] - mr[1];
+        double dr = mt[2] - mr[2];
+        double dist = std::sqrt(db * db + dg * dg + dr * dr);
+        // convert to [0,1] where 1 = identical mean color
+        // sigma tuned for 8-bit BGR space (larger sigma => less penalty)
+        double sigma = 80.0;
+        return (float)std::exp(-dist / sigma);
+    }
+
     void reset_kf(float cx, float cy) {
         kf.init(4, 2, 0, CV_32F);
         kf.transitionMatrix = (cv::Mat_<float>(4,4) <<
@@ -527,13 +541,13 @@ struct PixelTracker {
     }
 
     // Global bootstrap: scan all templates once and keep top-K.
-    bool bootstrap(const cv::Mat &frame_edges, int frameIdx, const OfflineOptions &opt,
+    bool bootstrap(const cv::Mat &frame_bgr, const cv::Mat &frame_edges, int frameIdx, const OfflineOptions &opt,
                    double &bootstrap_ms, int &scanned) {
         auto t0 = std::chrono::steady_clock::now();
         scanned = 0;
         activeTemplates.clear();
 
-        struct Cand { float score; int ti; cv::Point pt; cv::Size wh; };
+        struct Cand { float score; float edge; float color; int ti; cv::Point pt; cv::Size wh; };
         std::vector<Cand> cands;
         cands.reserve(g_pixel_templates.size());
 
@@ -560,7 +574,18 @@ struct PixelTracker {
             double minV, maxV;
             cv::Point minP, maxP;
             cv::minMaxLoc(res, &minV, &maxV, &minP, &maxP);
-            cands.push_back(Cand{(float)maxV, ti, maxP, cv::Size(tw, th)});
+            cv::Rect patch(maxP.x, maxP.y, tw, th);
+            patch = clamp_rect(patch, frame_edges.size());
+            float cscore = 0.0f;
+            if (patch.width == tw && patch.height == th && !frame_bgr.empty()) {
+                cv::Mat tpl_bgr_rs;
+                cv::resize(tmpl.bgr, tpl_bgr_rs, cv::Size(tw, th), 0, 0, cv::INTER_NEAREST);
+                cv::Mat roi_bgr = frame_bgr(patch);
+                cscore = color_score_mean_bgr(tpl_bgr_rs, roi_bgr);
+            }
+            float edge = (float)maxV;
+            float final = 0.7f * edge + 0.3f * cscore;
+            cands.push_back(Cand{final, edge, cscore, ti, maxP, cv::Size(tw, th)});
         }
 
         std::sort(cands.begin(), cands.end(), [](const Cand &a, const Cand &b){ return a.score > b.score; });
@@ -591,7 +616,7 @@ struct PixelTracker {
         return true;
     }
 
-    bool roi_match(const cv::Mat &frame_edges, int frameIdx, const OfflineOptions &opt,
+    bool roi_match(const cv::Mat &frame_bgr, const cv::Mat &frame_edges, int frameIdx, const OfflineOptions &opt,
                    cv::Rect &outBox, float &outScore, int &outTemplateIdx,
                    double &roi_ms, int &scanned) {
         auto t0 = std::chrono::steady_clock::now();
@@ -647,8 +672,21 @@ struct PixelTracker {
             double minV, maxV;
             cv::Point minP, maxP;
             cv::minMaxLoc(res, &minV, &maxV, &minP, &maxP);
-            if ((float)maxV > bestScore) {
-                bestScore = (float)maxV;
+            // Color check at best location inside ROI
+            cv::Rect patch(roi.x + maxP.x, roi.y + maxP.y, tw, th);
+            patch = clamp_rect(patch, frame_edges.size());
+            float cscore = 0.0f;
+            if (patch.width == tw && patch.height == th && !frame_bgr.empty()) {
+                cv::Mat tpl_bgr_rs;
+                cv::resize(tmpl.bgr, tpl_bgr_rs, cv::Size(tw, th), 0, 0, cv::INTER_NEAREST);
+                cv::Mat roi_bgr = frame_bgr(patch);
+                cscore = color_score_mean_bgr(tpl_bgr_rs, roi_bgr);
+            }
+            float edge = (float)maxV;
+            float final = 0.7f * edge + 0.3f * cscore;
+
+            if (final > bestScore) {
+                bestScore = final;
                 bestPt = maxP;
                 bestWH = cv::Size(tw, th);
                 bestTi = ti;
@@ -1244,14 +1282,14 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                         (pixelTracker.lostCount >= std::max(1, opt.pixelLostMax));
 
                     if (need_bootstrap) {
-                        bool ok = pixelTracker.bootstrap(frame_edges, frameIdx, opt, pixel_bootstrap_ms, pixel_scanned_bootstrap);
+                        bool ok = pixelTracker.bootstrap(frame, frame_edges, frameIdx, opt, pixel_bootstrap_ms, pixel_scanned_bootstrap);
                         (void)ok;
                     }
 
                     cv::Rect box;
                     float score = 0.0f;
                     int bestTi = -1;
-                    bool ok2 = pixelTracker.roi_match(frame_edges, frameIdx, opt, box, score, bestTi, pixel_roi_ms, pixel_scanned_roi);
+                    bool ok2 = pixelTracker.roi_match(frame, frame_edges, frameIdx, opt, box, score, bestTi, pixel_roi_ms, pixel_scanned_roi);
                     if (ok2 && score >= opt.pixelMinScore && box.area() > 0 && bestTi >= 0) {
                         pixelTracker.lostCount = 0;
 
