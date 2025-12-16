@@ -27,6 +27,8 @@ struct OfflineOptions {
     std::string templatesDir; // Directory containing multiple templates for pixel mode
     bool yoloClassConsistentColor = false; // YOLO mode: paint masks with class-consistent colors (better motion pred)
     bool recordTiming = false; // Record per-frame timing stats into report.json (no extra printing)
+    bool yoloLatentKey = false; // YOLO offline simulator: assign template_id via maskCoeff embedding, no hashing on client
+    float latentCosineThreshold = 0.95f; // cosine similarity threshold to reuse template_id
 };
 
 struct DictItem {

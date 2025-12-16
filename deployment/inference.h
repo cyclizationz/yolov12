@@ -4,6 +4,7 @@
 
 #include <string>
 #include <vector>
+#include <array>
 #include <opencv2/opencv.hpp>
 #include "onnxruntime_cxx_api.h"
 
@@ -48,6 +49,7 @@ typedef struct _DL_RESULT
     std::vector<cv::Point2f> keyPoints;
     cv::Mat boxMask; // Added for segmentation mask
     std::string seiPath; // For pixel mode / SEI: relative template path key for stitching
+    std::array<float, 32> maskCoeff{}; // YOLOv12-seg mask embedding (latent vector), normalized later if needed
 } DL_RESULT;
 
 class YOLO_V8

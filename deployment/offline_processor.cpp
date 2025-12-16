@@ -9,6 +9,7 @@
 #include <cmath>
 #include <unordered_set>
 #include <chrono>
+#include <array>
 #include <opencv2/dnn.hpp>
 #include "sei_parser.h"
 
@@ -304,6 +305,21 @@ static float iou_rect(const cv::Rect &a, const cv::Rect &b) {
     int inter = std::max(0, x2 - x1) * std::max(0, y2 - y1);
     int ua = a.area() + b.area() - inter;
     return ua > 0 ? (float)inter / (float)ua : 0.0f;
+}
+
+static std::array<float, 32> l2_normalize_32(const std::array<float, 32> &v) {
+    double s2 = 0.0;
+    for (float x : v) s2 += (double)x * (double)x;
+    double inv = (s2 > 1e-12) ? (1.0 / std::sqrt(s2)) : 0.0;
+    std::array<float, 32> out{};
+    for (size_t i = 0; i < 32; ++i) out[i] = (float)(v[i] * inv);
+    return out;
+}
+
+static float cosine_sim_32(const std::array<float, 32> &a, const std::array<float, 32> &b) {
+    double dot = 0.0;
+    for (size_t i = 0; i < 32; ++i) dot += (double)a[i] * (double)b[i];
+    return (float)dot;
 }
 
 // Calibrate best scale per template using the first frame's edges.
@@ -841,7 +857,7 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
     OfflineProcessor processor(opt.outDir, opt.pixelMode ? "" : opt.dictDir);
     
     // Load existing dictionary only for traditional (YOLO) mode
-    if (!opt.pixelMode) {
+    if (!opt.pixelMode && !opt.yoloLatentKey) {
         if (processor.loadDictionary()) {
             std::cout << "Loaded existing dictionary with " << processor.getDict().size() << " items." << std::endl;
         } else {
@@ -923,6 +939,25 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
         bool valid{false};
     };
     std::unordered_map<int, LastTpl> last_tpl_by_class;
+
+    // Latent-key offline simulator state (YOLO only): template_id -> embedding/path
+    uint32_t next_template_id = 1;
+    struct LatentTpl {
+        uint32_t id{0};
+        int cls{0};
+        cv::Size wh{};
+        std::array<float, 32> emb_norm{};
+        std::string path; // saved RGBA template path
+    };
+    std::vector<LatentTpl> latent_bank;
+    std::unordered_map<uint32_t, size_t> latent_id_to_index;
+    struct LastLatent {
+        cv::Rect box;
+        uint32_t id{0};
+        std::array<float, 32> emb_norm{};
+        bool valid{false};
+    };
+    std::unordered_map<int, LastLatent> last_latent_by_class;
     
     int frameIdx = 0;
     cv::Mat frame;
@@ -957,12 +992,15 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
         // Track which YOLO hashes are NEW in this frame. A real client cannot recover these
         // until the corresponding template is transmitted out-of-band.
         std::unordered_set<std::string> yolo_new_hashes_this_frame;
+        std::unordered_set<uint32_t> yolo_new_tplids_this_frame;
         // Cache canonical hashes per detection index for pass-2 recovery.
         std::vector<std::string> det_hashes;
         std::vector<uint8_t> det_is_new;
+        std::vector<uint32_t> det_tplids;
         if (!opt.pixelMode) {
             det_hashes.resize(dets.size());
             det_is_new.assign(dets.size(), 0);
+            det_tplids.assign(dets.size(), 0);
         }
 
         // Pass 1: paint masked stream (server output) + build canonical template keying
@@ -1004,7 +1042,103 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                 }
                 if (maskROI.empty()) continue;
 
-                // Keying should be position-invariant: hash / phash the cropped ROI only.
+                // YOLO latent-key mode: assign template_id by maskCoeff embedding similarity.
+                if (opt.yoloLatentKey) {
+                    auto t_dict0 = std::chrono::steady_clock::now();
+
+                    // Normalize embedding
+                    std::array<float, 32> emb = l2_normalize_32(d.maskCoeff);
+
+                    // Temporal stability: if last template for this class overlaps strongly, prefer it
+                    uint32_t chosen_id = 0;
+                    bool is_new = false;
+                    auto itLast = last_latent_by_class.find(d.classId);
+                    if (itLast != last_latent_by_class.end() && itLast->second.valid) {
+                        float iou = iou_rect(itLast->second.box, safeBox);
+                        if (iou >= 0.7f) {
+                            float sim = cosine_sim_32(emb, itLast->second.emb_norm);
+                            if (sim >= (opt.latentCosineThreshold - 0.01f)) {
+                                chosen_id = itLast->second.id;
+                            }
+                        }
+                    }
+
+                    // Global search if no temporal reuse
+                    if (chosen_id == 0) {
+                        float bestSim = -1.0f;
+                        uint32_t bestId = 0;
+                        for (const auto &tpl : latent_bank) {
+                            if (tpl.cls != d.classId) continue;
+                            if (std::abs(tpl.wh.width - safeBox.width) > 2 || std::abs(tpl.wh.height - safeBox.height) > 2) continue;
+                            float sim = cosine_sim_32(emb, tpl.emb_norm);
+                            if (sim > bestSim) {
+                                bestSim = sim;
+                                bestId = tpl.id;
+                            }
+                        }
+                        if (bestId != 0 && bestSim >= opt.latentCosineThreshold) {
+                            chosen_id = bestId;
+                        }
+                    }
+
+                    if (chosen_id == 0) {
+                        // Mint new template_id and save RGBA template
+                        chosen_id = next_template_id++;
+                        is_new = true;
+
+                        cv::Mat rgba = OfflineProcessor::extract_object_rgba(frame, d.boxMask, safeBox);
+                        fs::path out_png = fs::path(opt.dictDir) / (std::to_string(chosen_id) + ".png");
+                        try { cv::imwrite(out_png.string(), rgba); } catch (...) {}
+
+                        LatentTpl tpl;
+                        tpl.id = chosen_id;
+                        tpl.cls = d.classId;
+                        tpl.wh = safeBox.size();
+                        tpl.emb_norm = emb;
+                        tpl.path = out_png.string();
+                        latent_id_to_index[tpl.id] = latent_bank.size();
+                        latent_bank.push_back(std::move(tpl));
+                    } else {
+                        matched_occurrences++;
+                    }
+
+                    det_tplids[di] = chosen_id;
+                    det_is_new[di] = is_new ? 1 : 0;
+                    if (is_new) {
+                        yolo_new_tplids_this_frame.insert(chosen_id);
+                    }
+
+                    // Update last selection for this class
+                    LastLatent ll;
+                    ll.box = safeBox;
+                    ll.id = chosen_id;
+                    ll.emb_norm = emb;
+                    ll.valid = true;
+                    last_latent_by_class[d.classId] = std::move(ll);
+
+                    auto t_dict1 = std::chrono::steady_clock::now();
+                    dict_ms += std::chrono::duration<double, std::milli>(t_dict1 - t_dict0).count();
+
+                    // Paint masked stream
+                    cv::Vec3b color = opt.yoloClassConsistentColor ? yolo_class_color(d.classId) : cv::Vec3b(0, 255, 0);
+                    OfflineProcessor::paint_mask_color(processed, d.boxMask, d.box, color, opt.paintAlpha);
+
+                    if (seiOut.is_open()) {
+                        SEIRegion r{};
+                        r.id = chosen_id; // template_id (stable across frames)
+                        r.x = (uint32_t)std::max(0, d.box.x);
+                        r.y = (uint32_t)std::max(0, d.box.y);
+                        r.w = (uint32_t)std::max(0, d.box.width);
+                        r.h = (uint32_t)std::max(0, d.box.height);
+                        r.flags = is_new ? 0 : 1;
+                        r.class_id = (uint8_t)std::max(0, std::min(255, d.classId));
+                        r.path.clear(); // no client hashing; id is enough
+                        sei_regions.push_back(std::move(r));
+                    }
+                    continue;
+                }
+
+                // pHash-keying mode (legacy simulator): position-invariant pHash on cropped ROI.
                 auto t_dict0 = std::chrono::steady_clock::now();
                 uint64_t ph = OfflineProcessor::mask_phash64(maskROI);
                 // Temporal stability: if last template for this class overlaps strongly and is phash-close,
@@ -1103,6 +1237,24 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                     matched_occurrences++; // treat as matched since we can always recover from template set
                 }
             } else {
+                if (opt.yoloLatentKey) {
+                    uint32_t tid = det_tplids[di];
+                    if (!tid) continue;
+                    if (det_is_new[di] || yolo_new_tplids_this_frame.find(tid) != yolo_new_tplids_this_frame.end()) {
+                        continue;
+                    }
+                    auto itIdx = latent_id_to_index.find(tid);
+                    if (itIdx == latent_id_to_index.end()) continue;
+                    const auto &tpl = latent_bank[itIdx->second];
+                    cv::Mat img = cv::imread(tpl.path, cv::IMREAD_UNCHANGED);
+                    if (!img.empty()) {
+                        if (img.cols != d.box.width || img.rows != d.box.height) {
+                            cv::resize(img, img, d.box.size(), 0, 0, cv::INTER_NEAREST);
+                        }
+                        overlay_template_rgba(recovered, img, d.box);
+                    }
+                    continue;
+                }
                 const std::string &canon = det_hashes[di];
                 if (canon.empty()) continue;
                 // Only recover if this object is NOT new in this frame (client already has template).
@@ -1198,6 +1350,11 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
     report["avg_recovered_ssim"] = avg_rec_ssim;
     report["avg_recovered_psnr"] = avg_rec_psnr;
     report["timing_enabled"] = opt.recordTiming;
+    report["latent_key_enabled"] = opt.yoloLatentKey;
+    if (opt.yoloLatentKey) {
+        report["latent_bank_size"] = (uint64_t)latent_bank.size();
+        report["latent_cosine_threshold"] = opt.latentCosineThreshold;
+    }
     if (opt.recordTiming && !t_total_ms.empty()) {
         auto avg = [](const std::vector<double> &v){
             double s = 0.0;

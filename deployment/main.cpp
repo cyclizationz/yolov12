@@ -26,6 +26,8 @@ void print_usage(const char* program_name) {
               << "  -T <templates_dir>      Directory containing multiple pixel templates (defaults from TM_TEMPLATE_PATH or ./)\n"
               << "  --yolo-class-color      YOLO mode: paint masks with class-consistent colors (instead of hash colors)\n"
               << "  --timing                Record per-frame timing stats into report.json\n"
+              << "  --latent-key            YOLO offline sim: assign template_id by maskCoeff embedding (no client hashing)\n"
+              << "  --latent-thr <float>    Cosine similarity threshold for template reuse (default: 0.95)\n"
               << "  --cpu                   Force CPU inference (explicit flag)\n"
               << "  -h                      Show this help message\n";
 }
@@ -41,6 +43,8 @@ int main(int argc, char* argv[]) {
         {"pixel", no_argument, 0, 'p'},
         {"yolo-class-color", no_argument, 0, 'Y'},
         {"timing", no_argument, 0, 'R'},
+        {"latent-key", no_argument, 0, 'L'},
+        {"latent-thr", required_argument, 0, 'Z'},
         {0, 0, 0, 0}
     };
 
@@ -86,6 +90,12 @@ int main(int argc, char* argv[]) {
                 break;
             case 'R':
                 opt.recordTiming = true;
+                break;
+            case 'L':
+                opt.yoloLatentKey = true;
+                break;
+            case 'Z':
+                opt.latentCosineThreshold = std::stof(optarg);
                 break;
             case 'h':
                 print_usage(argv[0]);

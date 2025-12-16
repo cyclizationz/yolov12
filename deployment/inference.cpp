@@ -289,6 +289,11 @@ char* YOLO_V8::TensorProcess(clock_t& starttime_1, cv::Mat& iImg, N& blob, std::
             result.classId = class_ids[idx];
             result.confidence = confidences[idx];
             result.box = boxes[idx];
+            // Store the 32-d mask coefficient vector as a latent embedding for offline template-id assignment.
+            // This is raw (not normalized) by default; offline simulator can normalize if needed.
+            for (int j = 0; j < 32; ++j) {
+                result.maskCoeff[(size_t)j] = mask_coeffs[idx][(size_t)j];
+            }
             
             // Generate mask
             // 1. Matrix multiply coeffs (1, 32) * proto (32, 25600) -> (1, 25600)
