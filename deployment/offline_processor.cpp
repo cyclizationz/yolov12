@@ -989,6 +989,15 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
     };
     std::unordered_map<int, LastLatent> last_latent_by_class;
     std::unordered_map<int, int> latent_boost_until_frame; // per class
+
+    // Client-side fallback: if a template_id is "new" this frame (not yet delivered),
+    // reuse the last recoverable template for the same class to avoid flashing.
+    struct LastClientTpl {
+        cv::Rect box;
+        uint32_t id{0};
+        bool valid{false};
+    };
+    std::unordered_map<int, LastClientTpl> last_client_tpl_by_class;
     
     int frameIdx = 0;
     cv::Mat frame;
@@ -1315,10 +1324,26 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                 if (opt.yoloLatentKey) {
                     uint32_t tid = det_tplids[di];
                     if (!tid) continue;
-                    if (det_is_new[di] || yolo_new_tplids_this_frame.find(tid) != yolo_new_tplids_this_frame.end()) {
-                        continue;
+                    bool is_new_for_client = det_is_new[di] || (yolo_new_tplids_this_frame.find(tid) != yolo_new_tplids_this_frame.end());
+
+                    uint32_t use_id = tid;
+                    if (is_new_for_client) {
+                        // Fallback to last recoverable template for this class if bbox overlaps enough.
+                        auto itLast = last_client_tpl_by_class.find(d.classId);
+                        if (itLast != last_client_tpl_by_class.end() && itLast->second.valid) {
+                            float iou = iou_rect(itLast->second.box, d.box);
+                            if (iou >= 0.5f) {
+                                use_id = itLast->second.id;
+                                is_new_for_client = false; // treat as recoverable via fallback
+                            } else {
+                                continue; // no good fallback, keep masked pixels
+                            }
+                        } else {
+                            continue; // no cached fallback
+                        }
                     }
-                    auto itIdx = latent_id_to_index.find(tid);
+
+                    auto itIdx = latent_id_to_index.find(use_id);
                     if (itIdx == latent_id_to_index.end()) continue;
                     const auto &tpl = latent_bank[itIdx->second];
                     cv::Mat img = cv::imread(tpl.path, cv::IMREAD_UNCHANGED);
@@ -1327,6 +1352,13 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                             cv::resize(img, img, d.box.size(), 0, 0, cv::INTER_NEAREST);
                         }
                         overlay_template_rgba(recovered, img, d.box);
+
+                        // Update last client template for this class (recoverable/cached)
+                        LastClientTpl lc;
+                        lc.box = d.box;
+                        lc.id = use_id;
+                        lc.valid = true;
+                        last_client_tpl_by_class[d.classId] = std::move(lc);
                     }
                     continue;
                 }
