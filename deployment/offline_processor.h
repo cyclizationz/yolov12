@@ -46,6 +46,13 @@ struct OfflineOptions {
     // Experiment support: dump per-frame latent embeddings to analyze similarity/thresholds offline.
     bool dumpLatents = false;
     std::string latentsOutPath = ""; // defaults to <outDir>/latents.jsonl when enabled
+
+    // Pixel mode tracking (Kalman + ROI template matching)
+    int pixelBootstrapInterval = 30; // frames between global re-bootstrap
+    int pixelTopK = 3;              // keep top-K templates after bootstrap
+    int pixelRoiPad = 40;           // ROI padding around predicted box (px)
+    float pixelMinScore = 0.65f;    // min NCC score to accept ROI match
+    int pixelLostMax = 5;           // re-bootstrap after N consecutive low-score frames
 };
 
 struct DictItem {

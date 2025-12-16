@@ -491,6 +491,197 @@ static void template_match_detections(const cv::Mat &frame_bgr,
     }
 }
 
+// -----------------------------------------------------------------------------
+// Pixel tracker: Kalman + ROI template matching with periodic re-bootstrap
+// -----------------------------------------------------------------------------
+struct PixelTracker {
+    bool inited{false};
+    int lastBootstrapFrame{-999999};
+    int lostCount{0};
+    std::vector<int> activeTemplates; // indices into g_pixel_templates
+    cv::Rect lastBox{};
+    float lastScore{0.0f};
+
+    // Kalman: state [cx, cy, vx, vy], measurement [cx, cy]
+    cv::KalmanFilter kf;
+
+    void reset_kf(float cx, float cy) {
+        kf.init(4, 2, 0, CV_32F);
+        kf.transitionMatrix = (cv::Mat_<float>(4,4) <<
+            1,0,1,0,
+            0,1,0,1,
+            0,0,1,0,
+            0,0,0,1);
+        cv::setIdentity(kf.measurementMatrix);
+        cv::setIdentity(kf.processNoiseCov, cv::Scalar::all(1e-3));
+        cv::setIdentity(kf.measurementNoiseCov, cv::Scalar::all(5e-2));
+        cv::setIdentity(kf.errorCovPost, cv::Scalar::all(1));
+        kf.statePost.at<float>(0) = cx;
+        kf.statePost.at<float>(1) = cy;
+        kf.statePost.at<float>(2) = 0.0f;
+        kf.statePost.at<float>(3) = 0.0f;
+    }
+
+    static cv::Rect clamp_rect(const cv::Rect &r, const cv::Size &sz) {
+        return r & cv::Rect(0, 0, sz.width, sz.height);
+    }
+
+    // Global bootstrap: scan all templates once and keep top-K.
+    bool bootstrap(const cv::Mat &frame_edges, int frameIdx, const OfflineOptions &opt,
+                   double &bootstrap_ms, int &scanned) {
+        auto t0 = std::chrono::steady_clock::now();
+        scanned = 0;
+        activeTemplates.clear();
+
+        struct Cand { float score; int ti; cv::Point pt; cv::Size wh; };
+        std::vector<Cand> cands;
+        cands.reserve(g_pixel_templates.size());
+
+        for (int ti = 0; ti < (int)g_pixel_templates.size(); ++ti) {
+            const auto &tmpl = g_pixel_templates[(size_t)ti];
+            if (tmpl.edges.empty()) continue;
+            scanned++;
+
+            double s = 1.0;
+            if (g_pixel_scales_calibrated && (size_t)ti < g_pixel_template_scales.size()) {
+                s = g_pixel_template_scales[(size_t)ti];
+            }
+            int th = (int)(tmpl.edges.rows * s);
+            int tw = (int)(tmpl.edges.cols * s);
+            if (th < 8 || tw < 8) continue;
+            if (th >= frame_edges.rows || tw >= frame_edges.cols) continue;
+
+            cv::Mat tmpl_rs;
+            cv::resize(tmpl.edges, tmpl_rs, cv::Size(tw, th), 0, 0, cv::INTER_AREA);
+
+            cv::Mat res;
+            cv::matchTemplate(frame_edges, tmpl_rs, res, cv::TM_CCOEFF_NORMED);
+            if (res.empty()) continue;
+            double minV, maxV;
+            cv::Point minP, maxP;
+            cv::minMaxLoc(res, &minV, &maxV, &minP, &maxP);
+            cands.push_back(Cand{(float)maxV, ti, maxP, cv::Size(tw, th)});
+        }
+
+        std::sort(cands.begin(), cands.end(), [](const Cand &a, const Cand &b){ return a.score > b.score; });
+        int topK = std::max(1, opt.pixelTopK);
+        if ((int)cands.size() > topK) cands.resize(topK);
+        for (auto &c : cands) activeTemplates.push_back(c.ti);
+
+        // Use best candidate as measurement
+        if (cands.empty()) {
+            auto t1 = std::chrono::steady_clock::now();
+            bootstrap_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            return false;
+        }
+
+        auto &best = cands[0];
+        lastScore = best.score;
+        lastBox = clamp_rect(cv::Rect(best.pt.x, best.pt.y, best.wh.width, best.wh.height), frame_edges.size());
+        float cx = lastBox.x + lastBox.width * 0.5f;
+        float cy = lastBox.y + lastBox.height * 0.5f;
+        reset_kf(cx, cy);
+
+        inited = true;
+        lastBootstrapFrame = frameIdx;
+        lostCount = 0;
+
+        auto t1 = std::chrono::steady_clock::now();
+        bootstrap_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        return true;
+    }
+
+    bool roi_match(const cv::Mat &frame_edges, int frameIdx, const OfflineOptions &opt,
+                   cv::Rect &outBox, float &outScore, int &outTemplateIdx,
+                   double &roi_ms, int &scanned) {
+        auto t0 = std::chrono::steady_clock::now();
+        scanned = 0;
+
+        if (!inited || lastBox.area() <= 0) {
+            auto t1 = std::chrono::steady_clock::now();
+            roi_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            return false;
+        }
+
+        cv::Mat pred = kf.predict();
+        float pcx = pred.at<float>(0);
+        float pcy = pred.at<float>(1);
+        int pad = std::max(0, opt.pixelRoiPad);
+        cv::Rect roi((int)(pcx - lastBox.width * 0.5f) - pad,
+                     (int)(pcy - lastBox.height * 0.5f) - pad,
+                     lastBox.width + 2 * pad,
+                     lastBox.height + 2 * pad);
+        roi = clamp_rect(roi, frame_edges.size());
+        if (roi.width < 8 || roi.height < 8) {
+            auto t1 = std::chrono::steady_clock::now();
+            roi_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            return false;
+        }
+        cv::Mat roi_edges = frame_edges(roi);
+
+        float bestScore = -1.0f;
+        cv::Point bestPt(0,0);
+        cv::Size bestWH(0,0);
+        int bestTi = -1;
+
+        for (int ti : activeTemplates) {
+            if (ti < 0 || ti >= (int)g_pixel_templates.size()) continue;
+            const auto &tmpl = g_pixel_templates[(size_t)ti];
+            if (tmpl.edges.empty()) continue;
+            scanned++;
+
+            double s = 1.0;
+            if (g_pixel_scales_calibrated && (size_t)ti < g_pixel_template_scales.size()) {
+                s = g_pixel_template_scales[(size_t)ti];
+            }
+            int th = (int)(tmpl.edges.rows * s);
+            int tw = (int)(tmpl.edges.cols * s);
+            if (th < 8 || tw < 8) continue;
+            if (th >= roi_edges.rows || tw >= roi_edges.cols) continue;
+
+            cv::Mat tmpl_rs;
+            cv::resize(tmpl.edges, tmpl_rs, cv::Size(tw, th), 0, 0, cv::INTER_AREA);
+            cv::Mat res;
+            cv::matchTemplate(roi_edges, tmpl_rs, res, cv::TM_CCOEFF_NORMED);
+            if (res.empty()) continue;
+            double minV, maxV;
+            cv::Point minP, maxP;
+            cv::minMaxLoc(res, &minV, &maxV, &minP, &maxP);
+            if ((float)maxV > bestScore) {
+                bestScore = (float)maxV;
+                bestPt = maxP;
+                bestWH = cv::Size(tw, th);
+                bestTi = ti;
+            }
+        }
+
+        outScore = bestScore;
+        outTemplateIdx = bestTi;
+        if (bestTi < 0) {
+            auto t1 = std::chrono::steady_clock::now();
+            roi_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            return false;
+        }
+
+        cv::Rect b(roi.x + bestPt.x, roi.y + bestPt.y, bestWH.width, bestWH.height);
+        b = clamp_rect(b, frame_edges.size());
+        outBox = b;
+
+        // Kalman update
+        cv::Mat meas(2, 1, CV_32F);
+        meas.at<float>(0) = b.x + b.width * 0.5f;
+        meas.at<float>(1) = b.y + b.height * 0.5f;
+        kf.correct(meas);
+
+        lastBox = b;
+        lastScore = bestScore;
+
+        auto t1 = std::chrono::steady_clock::now();
+        roi_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        return true;
+    }
+};
+
 
 OfflineProcessor::OfflineProcessor(const std::string& outDir, const std::string& dictDir) 
     : outDir(outDir), dictDir(dictDir) {
@@ -947,6 +1138,8 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
 
     // Timing (optional, stored in report.json; no extra printing)
     std::vector<double> t_infer_ms, t_dict_ms, t_paint_ms, t_recover_ms, t_total_ms;
+    std::vector<double> t_pixel_bootstrap_ms, t_pixel_roi_ms;
+    std::vector<int> t_pixel_scanned_bootstrap, t_pixel_scanned_roi;
 
     // Optional latent dump (for threshold sweep experiments)
     std::ofstream latOut;
@@ -1000,6 +1193,9 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
     };
     std::unordered_map<int, LastClientTpl> last_client_tpl_by_class;
 
+    // Pixel mode tracker state (single-object tracker; ROI+Kalman)
+    PixelTracker pixelTracker;
+
     // Latent-key stats (server-side selection)
     uint64_t latent_minted = 0;
     uint64_t latent_reused = 0;
@@ -1024,11 +1220,58 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
         auto t_frame_start = std::chrono::steady_clock::now();
 
         std::vector<DL_RESULT> dets;
+        double pixel_bootstrap_ms = 0.0;
+        double pixel_roi_ms = 0.0;
+        int pixel_scanned_bootstrap = 0;
+        int pixel_scanned_roi = 0;
         {
             auto t0 = std::chrono::steady_clock::now();
             if (opt.pixelMode) {
-                // Use multi-template matching based detector for pixel games
-                template_match_detections(frame, dets, opt);
+                // Pixel mode: Kalman + ROI template matching, with periodic re-bootstrap.
+                if (!load_pixel_templates_once(opt)) {
+                    // no templates
+                } else {
+                    // Frame edges
+                    cv::Mat frame_gray, frame_edges;
+                    cv::cvtColor(frame, frame_gray, cv::COLOR_BGR2GRAY);
+                    cv::Canny(frame_gray, frame_edges, 50, 150);
+                    if (!g_pixel_scales_calibrated) {
+                        calibrate_template_scales(frame_edges);
+                    }
+
+                    bool need_bootstrap = (!pixelTracker.inited) ||
+                        (opt.pixelBootstrapInterval > 0 && (frameIdx - pixelTracker.lastBootstrapFrame) >= opt.pixelBootstrapInterval) ||
+                        (pixelTracker.lostCount >= std::max(1, opt.pixelLostMax));
+
+                    if (need_bootstrap) {
+                        bool ok = pixelTracker.bootstrap(frame_edges, frameIdx, opt, pixel_bootstrap_ms, pixel_scanned_bootstrap);
+                        (void)ok;
+                    }
+
+                    cv::Rect box;
+                    float score = 0.0f;
+                    int bestTi = -1;
+                    bool ok2 = pixelTracker.roi_match(frame_edges, frameIdx, opt, box, score, bestTi, pixel_roi_ms, pixel_scanned_roi);
+                    if (ok2 && score >= opt.pixelMinScore && box.area() > 0 && bestTi >= 0) {
+                        pixelTracker.lostCount = 0;
+
+                        DL_RESULT d{};
+                        d.confidence = score;
+                        d.box = box;
+                        d.boxMask = cv::Mat::zeros(frame.size(), CV_8UC1);
+                        cv::rectangle(d.boxMask, box, cv::Scalar(255), cv::FILLED);
+
+                        if (bestTi >= 0 && bestTi < (int)g_pixel_templates.size()) {
+                            const auto &tmpl = g_pixel_templates[(size_t)bestTi];
+                            d.classId = tmpl.kindId;
+                            d.seiPath = tmpl.relPath;
+                        }
+
+                        dets.push_back(std::move(d));
+                    } else {
+                        pixelTracker.lostCount++;
+                    }
+                }
             } else {
                 // Use YOLO model as before
                 if (yoloDetector.RunSession(frame, dets) != RET_OK) {
@@ -1461,6 +1704,14 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
             frame_indices.push_back(frameIdx);
             ssim_values.push_back(ssim);
             psnr_values.push_back(psnr);
+
+            if (opt.recordTiming) {
+                // Pixel-specific breakdown (0 if not pixel mode)
+                t_pixel_bootstrap_ms.push_back(opt.pixelMode ? pixel_bootstrap_ms : 0.0);
+                t_pixel_roi_ms.push_back(opt.pixelMode ? pixel_roi_ms : 0.0);
+                t_pixel_scanned_bootstrap.push_back(opt.pixelMode ? pixel_scanned_bootstrap : 0);
+                t_pixel_scanned_roi.push_back(opt.pixelMode ? pixel_scanned_roi : 0);
+            }
         }
 
         // Record quality metrics between baseline and recovered frame
@@ -1615,6 +1866,12 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
             item["paint_ms"] = t_paint_ms[i];
             item["recover_ms"] = t_recover_ms[i];
             item["total_ms"] = t_total_ms[i];
+            if (i < t_pixel_bootstrap_ms.size()) {
+                item["pixel_bootstrap_ms"] = t_pixel_bootstrap_ms[i];
+                item["pixel_roi_ms"] = t_pixel_roi_ms[i];
+                item["pixel_scanned_bootstrap"] = t_pixel_scanned_bootstrap[i];
+                item["pixel_scanned_roi"] = t_pixel_scanned_roi[i];
+            }
         }
         per_frame.push_back(item);
     }

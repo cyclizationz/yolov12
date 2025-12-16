@@ -24,6 +24,10 @@ void print_usage(const char* program_name) {
               << "  -e                      Enable offline evaluation (default: false) [Ignored in this version, always runs]\n"
               << "  -p, --pixel             Use template-matching detector for pixel games (skip YOLO model)\n"
               << "  -T <templates_dir>      Directory containing multiple pixel templates (defaults from TM_TEMPLATE_PATH or ./)\n"
+              << "  --pixel-bootstrap <n>   Pixel: global re-bootstrap interval in frames (default: 30)\n"
+              << "  --pixel-topk <n>        Pixel: keep top-K templates after bootstrap (default: 3)\n"
+              << "  --pixel-roi-pad <px>    Pixel: ROI padding around predicted box (default: 40)\n"
+              << "  --pixel-min-score <f>   Pixel: min NCC score to accept ROI match (default: 0.65)\n"
               << "  --yolo-class-color      YOLO mode: paint masks with class-consistent colors (instead of hash colors)\n"
               << "  --timing                Record per-frame timing stats into report.json\n"
               << "  --latent-key            YOLO offline sim: assign template_id by maskCoeff embedding (no client hashing)\n"
@@ -51,6 +55,10 @@ int main(int argc, char* argv[]) {
         {"pixel", no_argument, 0, 'p'},
         {"yolo-class-color", no_argument, 0, 'Y'},
         {"timing", no_argument, 0, 'R'},
+        {"pixel-bootstrap", required_argument, 0, 'b'},
+        {"pixel-topk", required_argument, 0, 'k'},
+        {"pixel-roi-pad", required_argument, 0, 'r'},
+        {"pixel-min-score", required_argument, 0, 'q'},
         {"latent-key", no_argument, 0, 'L'},
         {"latent-thr", required_argument, 0, 'Z'},
         {"latent-period", required_argument, 0, 'P'},
@@ -100,6 +108,18 @@ int main(int argc, char* argv[]) {
                 break;
             case 'T':
                 opt.templatesDir = optarg;
+                break;
+            case 'b':
+                opt.pixelBootstrapInterval = std::stoi(optarg);
+                break;
+            case 'k':
+                opt.pixelTopK = std::stoi(optarg);
+                break;
+            case 'r':
+                opt.pixelRoiPad = std::stoi(optarg);
+                break;
+            case 'q':
+                opt.pixelMinScore = std::stof(optarg);
                 break;
             case 'Y':
                 opt.yoloClassConsistentColor = true;
