@@ -44,6 +44,7 @@ struct PixelTemplate {
 static std::vector<PixelTemplate> g_pixel_templates;
 static bool g_pixel_templates_initialized = false;
 static std::vector<double> g_pixel_template_scales; // per-template chosen scale
+static std::vector<double> g_pixel_template_calib_max; // per-template best NCC max score on first frame
 static bool g_pixel_scales_calibrated = false;
 static std::string g_pixel_templates_root_dir;
 static std::unordered_map<std::string, int> g_pixel_relpath_to_index;
@@ -143,6 +144,7 @@ static bool load_pixel_templates_once(const OfflineOptions &opt) {
     g_pixel_kind_colors_loaded = false;
     g_pixel_scales_calibrated = false;
     g_pixel_template_scales.clear();
+    g_pixel_template_calib_max.clear();
 
     std::string dir = choose_templates_dir(opt);
     fs::path dirPath(dir);
@@ -340,6 +342,19 @@ static float cosine_sim_32(const std::array<float, 32> &a, const std::array<floa
     return (float)dot;
 }
 
+static float clampf(float v, float lo, float hi) {
+    return std::max(lo, std::min(hi, v));
+}
+
+static float pixel_template_accept_thr(int ti, const OfflineOptions &opt) {
+    if (!opt.pixelAdaptiveThr) return opt.pixelMinScore;
+    if (ti < 0 || (size_t)ti >= g_pixel_template_calib_max.size()) return opt.pixelMinScore;
+    float calib = (float)g_pixel_template_calib_max[(size_t)ti];
+    if (calib <= 0.0f) return opt.pixelMinScore;
+    float thr = opt.pixelThrK * calib;
+    return clampf(thr, opt.pixelThrLo, opt.pixelThrHi);
+}
+
 // Calibrate best scale per template using the first frame's edges.
 // We test multiple candidate scales and keep the one with the highest max NCC score.
 static void calibrate_template_scales(const cv::Mat &frame_edges) {
@@ -354,6 +369,7 @@ static void calibrate_template_scales(const cv::Mat &frame_edges) {
     };
 
     g_pixel_template_scales.assign(g_pixel_templates.size(), 1.0);
+    g_pixel_template_calib_max.assign(g_pixel_templates.size(), -1.0);
 
     for (size_t ti = 0; ti < g_pixel_templates.size(); ++ti) {
         const auto &tmpl = g_pixel_templates[ti];
@@ -385,6 +401,7 @@ static void calibrate_template_scales(const cv::Mat &frame_edges) {
         }
 
         g_pixel_template_scales[ti] = best_scale;
+        g_pixel_template_calib_max[ti] = best_score;
         std::cout << "[PixelTemplates] Calibrated template \"" << tmpl.relPath
                   << "\" best_scale=" << best_scale << " max_score=" << best_score
                   << std::endl;
@@ -655,8 +672,10 @@ struct PixelTracker {
         }
 
         std::sort(cands.begin(), cands.end(), [](const Cand &a, const Cand &b){ return a.score > b.score; });
-        int topK = std::max(1, opt.pixelTopK);
-        if ((int)cands.size() > topK) cands.resize(topK);
+        int topK = opt.pixelTopK;
+        if (topK <= 0) topK = (int)cands.size();
+        topK = std::max(1, topK);
+        if ((int)cands.size() > topK) cands.resize((size_t)topK);
         for (auto &c : cands) activeTemplates.push_back(c.ti);
 
         // Use best candidate as measurement
@@ -684,6 +703,7 @@ struct PixelTracker {
 
     bool roi_match(const cv::Mat &frame_bgr, const cv::Mat &frame_edges, int frameIdx, const OfflineOptions &opt,
                    cv::Rect &outBox, float &outScore, int &outTemplateIdx,
+                   std::vector<std::pair<int, float>> &outRanked, // (ti, score) sorted desc
                    double &roi_ms, int &scanned) {
         auto t0 = std::chrono::steady_clock::now();
         scanned = 0;
@@ -710,10 +730,10 @@ struct PixelTracker {
         }
         cv::Mat roi_edges = frame_edges(roi);
 
-        float bestScore = -1.0f;
-        cv::Point bestPt(0,0);
-        cv::Size bestWH(0,0);
-        int bestTi = -1;
+        outRanked.clear();
+        struct Cand { float score; int ti; cv::Point pt; cv::Size wh; };
+        std::vector<Cand> cands;
+        cands.reserve(activeTemplates.size());
 
         for (int ti : activeTemplates) {
             if (ti < 0 || ti >= (int)g_pixel_templates.size()) continue;
@@ -750,24 +770,23 @@ struct PixelTracker {
             }
             float edge = (float)maxV;
             float final = 0.7f * edge + 0.3f * cscore;
-
-            if (final > bestScore) {
-                bestScore = final;
-                bestPt = maxP;
-                bestWH = cv::Size(tw, th);
-                bestTi = ti;
-            }
+            cands.push_back(Cand{final, ti, maxP, cv::Size(tw, th)});
         }
 
-        outScore = bestScore;
-        outTemplateIdx = bestTi;
-        if (bestTi < 0) {
+        if (cands.empty()) {
             auto t1 = std::chrono::steady_clock::now();
             roi_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
             return false;
         }
 
-        cv::Rect b(roi.x + bestPt.x, roi.y + bestPt.y, bestWH.width, bestWH.height);
+        std::sort(cands.begin(), cands.end(), [](const Cand &a, const Cand &b){ return a.score > b.score; });
+        for (const auto &c : cands) outRanked.push_back({c.ti, c.score});
+
+        const auto &best = cands[0];
+        outScore = best.score;
+        outTemplateIdx = best.ti;
+
+        cv::Rect b(roi.x + best.pt.x, roi.y + best.pt.y, best.wh.width, best.wh.height);
         b = clamp_rect(b, frame_edges.size());
         outBox = b;
 
@@ -778,28 +797,28 @@ struct PixelTracker {
         kf.correct(meas);
 
         lastBox = b;
-        lastScore = bestScore;
+        lastScore = best.score;
 
         auto t1 = std::chrono::steady_clock::now();
         roi_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         return true;
     }
 
-    // Multi-peak scan: use predicted Y band (narrow) but full width, find multiple peaks for the chosen template.
-    bool band_scan_multi(const cv::Mat &frame_bgr, const cv::Mat &frame_edges, int bestTi,
+    // Multi-peak scan: given precomputed bands and optional dy shift, scan for one template and return many peaks.
+    bool band_scan_multi_precomputed(const cv::Mat &frame_bgr, const cv::Mat &frame_edges, int ti,
+                         const std::vector<int> &bandYs, float dy,
                          const OfflineOptions &opt,
                          std::vector<std::pair<cv::Rect, float>> &out,
-                         double &band_ms, double &row_ms, double &flow_ms, int &bands_used,
-                         int &scanned) {
+                         double &band_ms, int &scanned) {
         auto t0 = std::chrono::steady_clock::now();
         out.clear();
         scanned = 0;
-        if (bestTi < 0 || bestTi >= (int)g_pixel_templates.size()) {
+        if (ti < 0 || ti >= (int)g_pixel_templates.size()) {
             auto t1 = std::chrono::steady_clock::now();
             band_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
             return false;
         }
-        const auto &tmpl = g_pixel_templates[(size_t)bestTi];
+        const auto &tmpl = g_pixel_templates[(size_t)ti];
         if (tmpl.edges.empty()) {
             auto t1 = std::chrono::steady_clock::now();
             band_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -808,8 +827,8 @@ struct PixelTracker {
 
         // scale
         double s = 1.0;
-        if (g_pixel_scales_calibrated && (size_t)bestTi < g_pixel_template_scales.size()) {
-            s = g_pixel_template_scales[(size_t)bestTi];
+        if (g_pixel_scales_calibrated && (size_t)ti < g_pixel_template_scales.size()) {
+            s = g_pixel_template_scales[(size_t)ti];
         }
         int th = (int)(tmpl.edges.rows * s);
         int tw = (int)(tmpl.edges.cols * s);
@@ -819,24 +838,10 @@ struct PixelTracker {
             return false;
         }
 
-        // Determine band centers: row-energy peaks (N bands). Optionally shift by optical flow dy.
-        std::vector<int> bandYs;
-        select_bands_from_edges(frame_edges, opt.pixelNumBands, opt.pixelBandMinSep, bandYs, row_ms);
-        bands_used = (int)bandYs.size();
-
-        float dy = 0.0f;
-        if (opt.pixelUseFlow && !prev_gray.empty()) {
-            cv::Mat cur_gray;
-            cv::cvtColor(frame_bgr, cur_gray, cv::COLOR_BGR2GRAY);
-            estimate_flow_dy(prev_gray, cur_gray, opt.pixelFlowMaxPts, dy, flow_ms);
-            prev_gray = cur_gray;
-        } else if (prev_gray.empty() && opt.pixelUseFlow && !frame_bgr.empty()) {
-            cv::cvtColor(frame_bgr, prev_gray, cv::COLOR_BGR2GRAY);
-        }
-
         int padY = std::max(0, opt.pixelBandPadY);
         int maxPeaks = std::max(1, opt.pixelMaxPeaks);
         int nms = std::max(1, opt.pixelPeakNms);
+        float thr = pixel_template_accept_thr(ti, opt);
 
         cv::Mat tmpl_rs;
         cv::resize(tmpl.edges, tmpl_rs, cv::Size(tw, th), 0, 0, cv::INTER_AREA);
@@ -862,7 +867,7 @@ struct PixelTracker {
                 cv::Point minP, maxP;
                 cv::minMaxLoc(work, &minV, &maxV, &minP, &maxP);
                 float edge = (float)maxV;
-                if (edge < opt.pixelMinScore * 0.5f) break;
+                if (edge < thr * 0.5f) break;
 
                 cv::Rect patch(band.x + maxP.x, band.y + maxP.y, tw, th);
                 patch = clamp_rect(patch, frame_edges.size());
@@ -874,7 +879,7 @@ struct PixelTracker {
                         cscore = color_score_mean_bgr(tpl_bgr_rs, frame_bgr(patch));
                     }
                     float final = 0.7f * edge + 0.3f * cscore;
-                    if (final >= opt.pixelMinScore) out.push_back({patch, final});
+                    if (final >= thr) out.push_back({patch, final});
                 }
 
                 int sx0 = std::max(0, maxP.x - nms);
@@ -1350,6 +1355,7 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
     std::vector<double> t_pixel_bootstrap_ms, t_pixel_roi_ms, t_pixel_band_ms;
     std::vector<double> t_pixel_row_ms, t_pixel_flow_ms;
     std::vector<int> t_pixel_bands_used;
+    std::vector<json> t_pixel_template_counts; // per-frame: {relPath: count}
     std::vector<int> t_pixel_scanned_bootstrap, t_pixel_scanned_roi, t_pixel_scanned_band;
 
     // Optional latent dump (for threshold sweep experiments)
@@ -1467,18 +1473,53 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                     cv::Rect box;
                     float score = 0.0f;
                     int bestTi = -1;
-                    bool ok2 = pixelTracker.roi_match(frame, frame_edges, frameIdx, opt, box, score, bestTi, pixel_roi_ms, pixel_scanned_roi);
-                    if (ok2 && score >= opt.pixelMinScore && box.area() > 0 && bestTi >= 0) {
+                    std::vector<std::pair<int, float>> ranked; // (ti, score)
+                    bool ok2 = pixelTracker.roi_match(frame, frame_edges, frameIdx, opt, box, score, bestTi, ranked,
+                                                      pixel_roi_ms, pixel_scanned_roi);
+                    float bestThr = pixel_template_accept_thr(bestTi, opt);
+                    if (ok2 && score >= bestThr && box.area() > 0 && bestTi >= 0) {
                         pixelTracker.lostCount = 0;
 
-                        // Expand to multiple bricks: scan a narrow Y band but full width for many peaks (same template).
-                        std::vector<std::pair<cv::Rect, float>> peaks;
-                        pixelTracker.band_scan_multi(frame, frame_edges, bestTi, opt, peaks,
-                                                     pixel_band_ms, pixel_row_ms, pixel_flow_ms, pixel_bands_used,
-                                                     pixel_scanned_band);
+                        // Precompute bands once
+                        std::vector<int> bandYs;
+                        PixelTracker::select_bands_from_edges(frame_edges, opt.pixelNumBands, opt.pixelBandMinSep, bandYs, pixel_row_ms);
+                        pixel_bands_used = (int)bandYs.size();
 
-                        if (peaks.empty()) {
-                            // fallback to single detection
+                        // Optical flow dy once
+                        float dy = 0.0f;
+                        if (opt.pixelUseFlow && !pixelTracker.prev_gray.empty()) {
+                            PixelTracker::estimate_flow_dy(pixelTracker.prev_gray, frame_gray,
+                                                           opt.pixelFlowMaxPts, dy, pixel_flow_ms);
+                            pixelTracker.prev_gray = frame_gray;
+                        } else if (pixelTracker.prev_gray.empty() && opt.pixelUseFlow) {
+                            pixelTracker.prev_gray = frame_gray;
+                        }
+
+                        // Band-scan top-K templates (ranked by ROI score) to avoid missing variants (e.g. dark bricks).
+                        struct Peak { cv::Rect r; float s; int ti; };
+                        std::vector<Peak> all;
+                        int bandTopK = opt.pixelBandTopK;
+                        if (bandTopK <= 0) bandTopK = (int)ranked.size();
+                        if ((int)ranked.size() < bandTopK) bandTopK = (int)ranked.size();
+
+                        double band_ms_sum = 0.0;
+                        int scanned_sum = 0;
+                        for (int k = 0; k < bandTopK; ++k) {
+                            int ti = ranked[(size_t)k].first;
+                            std::vector<std::pair<cv::Rect, float>> peaks;
+                            double ms_i = 0.0;
+                            int scanned_i = 0;
+                            pixelTracker.band_scan_multi_precomputed(frame, frame_edges, ti, bandYs, dy, opt,
+                                                                     peaks, ms_i, scanned_i);
+                            band_ms_sum += ms_i;
+                            scanned_sum += scanned_i;
+                            for (auto &pp : peaks) all.push_back(Peak{pp.first, pp.second, ti});
+                        }
+                        pixel_band_ms = band_ms_sum;
+                        pixel_scanned_band = scanned_sum;
+
+                        // If nothing found, fallback to best single detection
+                        if (all.empty()) {
                             DL_RESULT d{};
                             d.confidence = score;
                             d.box = box;
@@ -1489,18 +1530,38 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                             d.seiPath = tmpl.relPath;
                             dets.push_back(std::move(d));
                         } else {
-                            for (auto &pp : peaks) {
+                            // Cross-template NMS to reduce confusion from similar-looking units
+                            std::sort(all.begin(), all.end(), [](const Peak &a, const Peak &b){ return a.s > b.s; });
+                            auto iou = [](const cv::Rect &a, const cv::Rect &b)->float {
+                                cv::Rect inter = a & b;
+                                float ia = (float)std::max(0, inter.area());
+                                float ua = (float)std::max(1, a.area() + b.area() - inter.area());
+                                return ia / ua;
+                            };
+                            const float nms_iou = 0.3f;
+                            std::vector<Peak> kept;
+                            kept.reserve(all.size());
+                            for (const auto &p : all) {
+                                bool ok = true;
+                                for (const auto &q : kept) {
+                                    if (iou(p.r, q.r) > nms_iou) { ok = false; break; }
+                                }
+                                if (ok) kept.push_back(p);
+                                if ((int)kept.size() >= opt.pixelMaxPeaks) break;
+                            }
+                            for (const auto &p : kept) {
                                 DL_RESULT d{};
-                                d.confidence = pp.second;
-                                d.box = pp.first;
+                                d.confidence = p.s;
+                                d.box = p.r;
                                 d.boxMask = cv::Mat::zeros(frame.size(), CV_8UC1);
                                 cv::rectangle(d.boxMask, d.box, cv::Scalar(255), cv::FILLED);
-                                const auto &tmpl = g_pixel_templates[(size_t)bestTi];
+                                const auto &tmpl = g_pixel_templates[(size_t)p.ti];
                                 d.classId = tmpl.kindId;
                                 d.seiPath = tmpl.relPath;
                                 dets.push_back(std::move(d));
                             }
                         }
+
                     } else {
                         pixelTracker.lostCount++;
                     }
@@ -1949,6 +2010,20 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                 t_pixel_row_ms.push_back(opt.pixelMode ? pixel_row_ms : 0.0);
                 t_pixel_flow_ms.push_back(opt.pixelMode ? pixel_flow_ms : 0.0);
                 t_pixel_bands_used.push_back(opt.pixelMode ? pixel_bands_used : 0);
+
+                if (opt.pixelMode) {
+                    std::unordered_map<std::string, int> cnt;
+                    for (const auto &d : dets) {
+                        if (d.confidence < opt.confThreshold) continue;
+                        if (d.seiPath.empty()) continue;
+                        cnt[d.seiPath] += 1;
+                    }
+                    json m = json::object();
+                    for (const auto &kv : cnt) m[kv.first] = kv.second;
+                    t_pixel_template_counts.push_back(std::move(m));
+                } else {
+                    t_pixel_template_counts.push_back(json::object());
+                }
             }
         }
 
@@ -2115,6 +2190,9 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                     item["pixel_row_ms"] = t_pixel_row_ms[i];
                     item["pixel_flow_ms"] = t_pixel_flow_ms[i];
                     item["pixel_bands_used"] = t_pixel_bands_used[i];
+                }
+                if (i < t_pixel_template_counts.size()) {
+                    item["pixel_template_counts"] = t_pixel_template_counts[i];
                 }
             }
         }

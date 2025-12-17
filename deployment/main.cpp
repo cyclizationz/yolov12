@@ -35,6 +35,11 @@ void print_usage(const char* program_name) {
               << "  --pixel-band-sep <px>   Pixel: min separation between band centers (default: 24)\n"
               << "  --pixel-flow <0|1>      Pixel: enable sparse optical flow stabilization (default: 1)\n"
               << "  --pixel-flow-pts <n>    Pixel: max LK points (default: 120)\n"
+              << "  --pixel-band-topk <n>   Pixel: scan top-K templates per frame in band scan (0=all active, default: 2)\n"
+              << "  --pixel-adaptive-thr <0|1> Pixel: adaptive per-template thresholding (default: 1)\n"
+              << "  --pixel-thr-k <f>       Pixel: threshold factor for adaptive threshold (default: 0.85)\n"
+              << "  --pixel-thr-lo <f>      Pixel: adaptive threshold clamp low (default: 0.30)\n"
+              << "  --pixel-thr-hi <f>      Pixel: adaptive threshold clamp high (default: 0.65)\n"
               << "  --yolo-class-color      YOLO mode: paint masks with class-consistent colors (instead of hash colors)\n"
               << "  --timing                Record per-frame timing stats into report.json\n"
               << "  --latent-key            YOLO offline sim: assign template_id by maskCoeff embedding (no client hashing)\n"
@@ -57,6 +62,14 @@ int main(int argc, char* argv[]) {
     opt.model = "../yolov12n-seg.onnx"; // Default model path
     opt.outDir = "../outputs"; // Default output directory
 
+    enum {
+        OPT_PIXEL_BAND_TOPK = 1001,
+        OPT_PIXEL_ADAPTIVE_THR = 1002,
+        OPT_PIXEL_THR_K = 1003,
+        OPT_PIXEL_THR_LO = 1004,
+        OPT_PIXEL_THR_HI = 1005
+    };
+
     static struct option long_options[] = {
         {"cpu",   no_argument, 0, 'C'},
         {"pixel", no_argument, 0, 'p'},
@@ -73,6 +86,11 @@ int main(int argc, char* argv[]) {
         {"pixel-band-sep", required_argument, 0, 'j'},
         {"pixel-flow", required_argument, 0, 'f'},
         {"pixel-flow-pts", required_argument, 0, 'x'},
+        {"pixel-band-topk", required_argument, 0, OPT_PIXEL_BAND_TOPK},
+        {"pixel-adaptive-thr", required_argument, 0, OPT_PIXEL_ADAPTIVE_THR},
+        {"pixel-thr-k", required_argument, 0, OPT_PIXEL_THR_K},
+        {"pixel-thr-lo", required_argument, 0, OPT_PIXEL_THR_LO},
+        {"pixel-thr-hi", required_argument, 0, OPT_PIXEL_THR_HI},
         {"latent-key", no_argument, 0, 'L'},
         {"latent-thr", required_argument, 0, 'Z'},
         {"latent-period", required_argument, 0, 'P'},
@@ -155,6 +173,21 @@ int main(int argc, char* argv[]) {
                 break;
             case 'x':
                 opt.pixelFlowMaxPts = std::stoi(optarg);
+                break;
+            case OPT_PIXEL_BAND_TOPK:
+                opt.pixelBandTopK = std::stoi(optarg);
+                break;
+            case OPT_PIXEL_ADAPTIVE_THR:
+                opt.pixelAdaptiveThr = (std::stoi(optarg) != 0);
+                break;
+            case OPT_PIXEL_THR_K:
+                opt.pixelThrK = std::stof(optarg);
+                break;
+            case OPT_PIXEL_THR_LO:
+                opt.pixelThrLo = std::stof(optarg);
+                break;
+            case OPT_PIXEL_THR_HI:
+                opt.pixelThrHi = std::stof(optarg);
                 break;
             case 'Y':
                 opt.yoloClassConsistentColor = true;

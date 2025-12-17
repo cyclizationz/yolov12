@@ -64,6 +64,15 @@ struct OfflineOptions {
     int pixelBandMinSep = 24;       // minimum separation between band centers (px)
     bool pixelUseFlow = true;       // enable sparse optical flow stabilization
     int pixelFlowMaxPts = 120;      // max points for LK flow
+
+    // Pixel multi-template scanning
+    int pixelBandTopK = 2;          // run band scan for top-K templates (ranked by ROI score). 0 => scan all active
+
+    // Pixel adaptive thresholding (reduces confusion by forcing high-score templates to be higher)
+    bool pixelAdaptiveThr = true;
+    float pixelThrK = 0.85f;        // accept threshold = clamp(pixelThrK * calib_max, pixelThrLo, pixelThrHi)
+    float pixelThrLo = 0.30f;
+    float pixelThrHi = 0.65f;
 };
 
 struct DictItem {
