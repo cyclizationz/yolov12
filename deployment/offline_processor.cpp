@@ -1262,7 +1262,93 @@ static bool template_alpha_matches_mask(
     if (m_area <= 0.0) return false;
     double miss_ratio = (double)miss / m_area;
 
-    return (iou >= iou_thr) && (extra_ratio <= extra_thr) && (miss_ratio <= extra_thr);
+    // In heal-only mode we primarily need to ensure we don't paint outside the current mask.
+    // Perfect equality is often unrealistic due to segmentation jitter, so use a softer rule:
+    // - template alpha must not spill outside current mask too much (extra_ratio)
+    // - optional IoU lower bound if caller wants it
+    // - miss_ratio is not critical if we paint using template alpha (not full mask)
+    bool ok_extra = (extra_ratio <= extra_thr);
+    bool ok_iou = (iou_thr <= 0.0f) ? true : (iou >= iou_thr);
+    (void)miss_ratio;
+    return ok_extra && ok_iou;
+}
+
+// Paint a bbox region with a solid color wherever the RGBA template has alpha>0.
+static void paint_bbox_alpha_color(cv::Mat &dst_bgr, const cv::Mat &rgba, const cv::Rect &bbox, const cv::Vec3b &color) {
+    if (dst_bgr.empty() || rgba.empty()) return;
+    if (dst_bgr.type() != CV_8UC3 || rgba.type() != CV_8UC4) return;
+    if (rgba.cols != bbox.width || rgba.rows != bbox.height) return;
+    cv::Rect safe = bbox & cv::Rect(0, 0, dst_bgr.cols, dst_bgr.rows);
+    if (safe.area() <= 0) return;
+    int dx0 = safe.x - bbox.x;
+    int dy0 = safe.y - bbox.y;
+    for (int y = 0; y < safe.height; ++y) {
+        int dy = safe.y + y;
+        const cv::Vec4b *srow = rgba.ptr<cv::Vec4b>(dy0 + y);
+        cv::Vec3b *drow = dst_bgr.ptr<cv::Vec3b>(dy);
+        for (int x = 0; x < safe.width; ++x) {
+            if (srow[dx0 + x][3] == 0) continue;
+            cv::Vec3b &dp = drow[safe.x + x];
+            dp = color;
+        }
+    }
+}
+
+// Find a small integer offset (dx,dy) that best aligns template alpha to the current mask within bbox.
+// We optimize for minimal alpha spill outside mask (extra_ratio), and maximal intersection.
+static bool best_alpha_mask_offset(
+    const cv::Mat &tpl_rgba_resized,
+    const cv::Mat &full_mask_u8,
+    const cv::Rect &bbox,
+    int max_shift,
+    int &best_dx,
+    int &best_dy,
+    double &best_extra_ratio_out
+) {
+    best_dx = 0; best_dy = 0; best_extra_ratio_out = 1e9;
+    if (tpl_rgba_resized.empty() || full_mask_u8.empty()) return false;
+    if (tpl_rgba_resized.type() != CV_8UC4) return false;
+    if (tpl_rgba_resized.cols != bbox.width || tpl_rgba_resized.rows != bbox.height) return false;
+    cv::Rect safe = bbox & cv::Rect(0, 0, full_mask_u8.cols, full_mask_u8.rows);
+    if (safe.area() <= 0) return false;
+
+    // Evaluate shifts
+    uint64_t best_inter = 0;
+    for (int dy = -max_shift; dy <= max_shift; ++dy) {
+        for (int dx = -max_shift; dx <= max_shift; ++dx) {
+            uint64_t inter = 0, extra = 0;
+            // Iterate on visible part; map mask pixel -> template pixel with shift
+            for (int y = 0; y < safe.height; ++y) {
+                int my = safe.y + y;
+                const uchar *mrow = full_mask_u8.ptr<uchar>(my);
+                int ty = (my - bbox.y) - dy;
+                if (ty < 0 || ty >= tpl_rgba_resized.rows) continue;
+                const cv::Vec4b *trow = tpl_rgba_resized.ptr<cv::Vec4b>(ty);
+                for (int x = 0; x < safe.width; ++x) {
+                    int mx = safe.x + x;
+                    int tx = (mx - bbox.x) - dx;
+                    if (tx < 0 || tx >= tpl_rgba_resized.cols) continue;
+                    bool m = (mrow[mx] != 0);
+                    bool t = (trow[tx][3] != 0);
+                    if (!t) continue;
+                    if (m) inter++;
+                    else extra++;
+                }
+            }
+            double t_area = (double)(inter + extra);
+            if (t_area <= 1.0) continue;
+            double extra_ratio = (double)extra / t_area;
+            // Primary objective: minimize spill, secondary: maximize intersection
+            if (extra_ratio < best_extra_ratio_out - 1e-9 ||
+                (std::abs(extra_ratio - best_extra_ratio_out) <= 1e-9 && inter > best_inter)) {
+                best_extra_ratio_out = extra_ratio;
+                best_inter = inter;
+                best_dx = dx;
+                best_dy = dy;
+            }
+        }
+    }
+    return best_extra_ratio_out < 1e9;
 }
 
 // --- Quality metrics (PSNR / SSIM) -----------------------------------------
@@ -1456,7 +1542,9 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
         std::array<float, 32> emb_norm{};
         bool valid{false};
     };
-    std::unordered_map<int, LastLatent> last_latent_by_class;
+    // Multi-instance support: maintain multiple "last" entries per class to avoid mixing
+    // templates when there are multiple objects of the same class in a frame (e.g., 2 guns).
+    std::unordered_map<int, std::vector<LastLatent>> last_latents_by_class;
     std::unordered_map<int, int> latent_boost_until_frame; // per class
 
     // Client-side fallback: if a template_id is "new" this frame (not yet delivered),
@@ -1466,7 +1554,8 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
         uint32_t id{0};
         bool valid{false};
     };
-    std::unordered_map<int, LastClientTpl> last_client_tpl_by_class;
+    // Multi-instance cache per class
+    std::unordered_map<int, std::vector<LastClientTpl>> last_client_tpls_by_class;
 
     // Pixel mode tracker state (single-object tracker; ROI+Kalman)
     PixelTracker pixelTracker;
@@ -1672,10 +1761,14 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
         std::vector<std::string> det_hashes;
         std::vector<uint8_t> det_is_new;
         std::vector<uint32_t> det_tplids;
+        std::vector<uint8_t> det_masked; // whether the server actually masked this region (client should stitch only then)
+        std::vector<cv::Rect> det_stitch_boxes; // bbox actually used for masking + stitching (may differ from detection bbox)
         if (!opt.pixelMode) {
             det_hashes.resize(dets.size());
             det_is_new.assign(dets.size(), 0);
             det_tplids.assign(dets.size(), 0);
+            det_masked.assign(dets.size(), 0);
+            det_stitch_boxes.assign(dets.size(), cv::Rect());
         }
 
         // Pass 1: paint masked stream (server output) + build canonical template keying
@@ -1731,14 +1824,24 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                     }
 
                     // Motion detection vs last box for this class
-                    auto itLastBox = last_latent_by_class.find(d.classId);
-                    if (itLastBox != last_latent_by_class.end() && itLastBox->second.valid) {
-                        float iou = iou_rect(itLastBox->second.box, safeBox);
-                        float cdist = center_dist_px(itLastBox->second.box, safeBox);
-                        float ad = area_ratio_delta(itLastBox->second.box, safeBox);
-                        if (iou < opt.latentMotionIouThr || cdist > opt.latentMotionCenterPx || ad > opt.latentMotionScaleThr) {
+                    auto itLastVec0 = last_latents_by_class.find(d.classId);
+                    if (itLastVec0 != last_latents_by_class.end()) {
+                        // compare against best-overlap instance for this class
+                        float best_iou = 0.0f;
+                        cv::Rect best_box;
+                        bool found = false;
+                        for (const auto &ll : itLastVec0->second) {
+                            if (!ll.valid) continue;
+                            float iou = iou_rect(ll.box, safeBox);
+                            if (iou > best_iou) { best_iou = iou; best_box = ll.box; found = true; }
+                        }
+                        if (found) {
+                            float cdist = center_dist_px(best_box, safeBox);
+                            float ad = area_ratio_delta(best_box, safeBox);
+                            if (best_iou < opt.latentMotionIouThr || cdist > opt.latentMotionCenterPx || ad > opt.latentMotionScaleThr) {
                             latent_boost_until_frame[d.classId] = frameIdx + std::max(0, opt.latentMotionBoostFrames);
                             latent_motion_boost_events++;
+                        }
                         }
                     }
                     auto itBoost = latent_boost_until_frame.find(d.classId);
@@ -1750,13 +1853,22 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                     // Temporal stability: if last template for this class overlaps strongly, prefer it
                     uint32_t chosen_id = 0;
                     bool is_new = false;
-                    auto itLast = last_latent_by_class.find(d.classId);
-                    if (itLast != last_latent_by_class.end() && itLast->second.valid) {
-                        float iou = iou_rect(itLast->second.box, safeBox);
-                        if (iou >= 0.7f) {
-                            float sim = cosine_sim_32(emb, itLast->second.emb_norm);
+                    auto itLastVec = last_latents_by_class.find(d.classId);
+                    if (itLastVec != last_latents_by_class.end()) {
+                        float best_iou = 0.0f;
+                        size_t best_idx = 0;
+                        bool found = false;
+                        for (size_t li = 0; li < itLastVec->second.size(); ++li) {
+                            const auto &ll = itLastVec->second[li];
+                            if (!ll.valid) continue;
+                            float iou = iou_rect(ll.box, safeBox);
+                            if (iou > best_iou) { best_iou = iou; best_idx = li; found = true; }
+                        }
+                        if (found && best_iou >= 0.7f) {
+                            const auto &ll = itLastVec->second[best_idx];
+                            float sim = cosine_sim_32(emb, ll.emb_norm);
                             if (sim >= (opt.latentCosineThreshold - 0.01f)) {
-                                chosen_id = itLast->second.id;
+                                chosen_id = ll.id;
                                 latent_reuse_cos_sims.push_back(sim);
                             }
                         }
@@ -1771,7 +1883,10 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                         auto t_search0 = std::chrono::steady_clock::now();
                         for (const auto &tpl : latent_bank) {
                             if (tpl.cls != d.classId) continue;
-                            if (std::abs(tpl.wh.width - safeBox.width) > 2 || std::abs(tpl.wh.height - safeBox.height) > 2) continue;
+                            // Heal-only: allow size mismatch (we can resize the template) and rely on spill checks.
+                            if (!opt.yoloHealOnly) {
+                                if (std::abs(tpl.wh.width - safeBox.width) > 2 || std::abs(tpl.wh.height - safeBox.height) > 2) continue;
+                            }
                             float sim = cosine_sim_32(emb, tpl.emb_norm);
                             if (sim > bestSim) {
                                 bestSim = sim;
@@ -1803,24 +1918,61 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                         latent_reuse_cos_sims.push_back(bestSim);
                     }
 
-                    // Heal-only gating: only mask if client can perfectly recover with an existing template.
+                    // Heal-only gating: only mask if the server can pick a template the client can
+                    // understand (i.e., already in storage AND consistent with current mask).
                     // - New templates are considered not yet available on client.
                     // - Reused templates must have alpha mask matching current segmentation mask.
                     bool healable_now = true;
+                    cv::Rect stitch_box = d.box;
                     if (opt.yoloHealOnly) {
                         healable_now = false;
-                        if (chosen_id != 0 && !force_mint) {
-                            auto itIdx = latent_id_to_index.find(chosen_id);
-                            if (itIdx != latent_id_to_index.end()) {
-                                const auto &tpl = latent_bank[itIdx->second];
-                                cv::Mat img = cv::imread(tpl.path, cv::IMREAD_UNCHANGED);
-                                if (!img.empty()) {
-                                    // For perfect healing, forbid template rescaling (resizing introduces mismatch).
-                                    if (img.cols == d.box.width && img.rows == d.box.height) {
-                                        healable_now = template_alpha_matches_mask(
-                                            img, d.boxMask, d.box, opt.yoloHealMaskIouThr, opt.yoloHealMaskExtraThr
-                                        );
-                                    }
+                        // Try chosen_id first (if it is a reuse candidate)
+                        auto try_id = [&](uint32_t cand_id) -> bool {
+                            auto itIdx = latent_id_to_index.find(cand_id);
+                            if (itIdx == latent_id_to_index.end()) return false;
+                            const auto &tpl = latent_bank[itIdx->second];
+                            cv::Mat img = cv::imread(tpl.path, cv::IMREAD_UNCHANGED);
+                            if (img.empty()) return false;
+                            if (img.cols != d.box.width || img.rows != d.box.height) {
+                                cv::resize(img, img, d.box.size(), 0, 0, cv::INTER_NEAREST);
+                            }
+                            // Allow a small shift to account for bbox jitter between frames.
+                            int dx = 0, dy = 0;
+                            double extra_ratio = 1e9;
+                            if (!best_alpha_mask_offset(img, d.boxMask, d.box, /*max_shift=*/2, dx, dy, extra_ratio)) {
+                                return false;
+                            }
+                            if (extra_ratio > (double)opt.yoloHealMaskExtraThr) return false;
+                            stitch_box = d.box + cv::Point(dx, dy);
+                            return true;
+                        };
+
+                        // In heal-only, we accept reuse candidates if they do not spill outside the current mask.
+                        // This is sufficient because we paint using template alpha (what we can heal), not full mask.
+                        if (chosen_id != 0 && !force_mint && try_id(chosen_id)) {
+                            healable_now = true;
+                        } else if (!force_mint) {
+                            // "Distance in the other order": select the best cosine candidate that ALSO matches mask.
+                            // Limit to a few candidates to avoid heavy IO.
+                            struct Cand { float sim; uint32_t id; };
+                            std::vector<Cand> cands;
+                            cands.reserve(8);
+                            for (const auto &tpl : latent_bank) {
+                                if (tpl.cls != d.classId) continue;
+                                if (!opt.yoloHealOnly) {
+                                    if (std::abs(tpl.wh.width - safeBox.width) > 2 || std::abs(tpl.wh.height - safeBox.height) > 2) continue;
+                                }
+                                float sim = cosine_sim_32(emb, tpl.emb_norm);
+                                cands.push_back({sim, tpl.id});
+                            }
+                            std::sort(cands.begin(), cands.end(), [](const Cand &a, const Cand &b){ return a.sim > b.sim; });
+                            const size_t topK = std::min<size_t>(5, cands.size());
+                            for (size_t k = 0; k < topK; ++k) {
+                                if (cands[k].sim < opt.latentCosineThreshold) break;
+                                if (try_id(cands[k].id)) {
+                                    chosen_id = cands[k].id;
+                                    healable_now = true;
+                                    break;
                                 }
                             }
                         }
@@ -1868,17 +2020,33 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
 
                     det_tplids[di] = chosen_id;
                     det_is_new[di] = is_new ? 1 : 0;
+                    det_stitch_boxes[di] = stitch_box;
                     if (is_new) {
                         yolo_new_tplids_this_frame.insert(chosen_id);
                     }
 
-                    // Update last selection for this class
-                    LastLatent ll;
-                    ll.box = safeBox;
-                    ll.id = chosen_id;
-                    ll.emb_norm = emb;
-                    ll.valid = true;
-                    last_latent_by_class[d.classId] = std::move(ll);
+                    // Update last selection for this class (multi-instance)
+                    {
+                        auto &vec = last_latents_by_class[d.classId];
+                        size_t best_idx = (size_t)-1;
+                        float best_iou = 0.0f;
+                        for (size_t li = 0; li < vec.size(); ++li) {
+                            if (!vec[li].valid) continue;
+                            float iou = iou_rect(vec[li].box, safeBox);
+                            if (iou > best_iou) { best_iou = iou; best_idx = li; }
+                        }
+                        LastLatent ll;
+                        ll.box = safeBox;
+                        ll.id = chosen_id;
+                        ll.emb_norm = emb;
+                        ll.valid = true;
+                        if (best_idx != (size_t)-1 && best_iou >= 0.3f) {
+                            vec[best_idx] = std::move(ll);
+                        } else {
+                            vec.push_back(std::move(ll));
+                            if (vec.size() > 8) vec.erase(vec.begin());
+                        }
+                    }
 
                     auto t_dict1 = std::chrono::steady_clock::now();
                     dict_ms += std::chrono::duration<double, std::milli>(t_dict1 - t_dict0).count();
@@ -1886,15 +2054,31 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                     // Paint masked stream only when healable (or when heal-only is disabled).
                     if (!opt.yoloHealOnly || healable_now) {
                         cv::Vec3b color = opt.yoloClassConsistentColor ? yolo_class_color(d.classId) : cv::Vec3b(0, 255, 0);
-                        OfflineProcessor::paint_mask_color(processed, d.boxMask, d.box, color, opt.paintAlpha);
+                        if (opt.yoloHealOnly) {
+                            // Heal-only: paint exactly what we can heal (template alpha), avoiding green edges.
+                            auto itIdx = latent_id_to_index.find(chosen_id);
+                            if (itIdx != latent_id_to_index.end()) {
+                                const auto &tpl = latent_bank[itIdx->second];
+                                cv::Mat img = cv::imread(tpl.path, cv::IMREAD_UNCHANGED);
+                                if (!img.empty()) {
+                                    if (img.cols != stitch_box.width || img.rows != stitch_box.height) {
+                                        cv::resize(img, img, stitch_box.size(), 0, 0, cv::INTER_NEAREST);
+                                    }
+                                    paint_bbox_alpha_color(processed, img, stitch_box, color);
+                                }
+                            }
+                        } else {
+                            OfflineProcessor::paint_mask_color(processed, d.boxMask, d.box, color, opt.paintAlpha);
+                        }
+                        det_masked[di] = 1;
 
                         if (seiOut.is_open()) {
                             SEIRegion r{};
                             r.id = chosen_id; // template_id (stable across frames)
-                            r.x = (uint32_t)std::max(0, d.box.x);
-                            r.y = (uint32_t)std::max(0, d.box.y);
-                            r.w = (uint32_t)std::max(0, d.box.width);
-                            r.h = (uint32_t)std::max(0, d.box.height);
+                            r.x = (uint32_t)std::max(0, stitch_box.x);
+                            r.y = (uint32_t)std::max(0, stitch_box.y);
+                            r.w = (uint32_t)std::max(0, stitch_box.width);
+                            r.h = (uint32_t)std::max(0, stitch_box.height);
                             r.flags = is_new ? 0 : 1;
                             r.class_id = (uint8_t)std::max(0, std::min(255, d.classId));
                             r.path.clear(); // no client hashing; id is enough
@@ -1967,6 +2151,7 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
 
                 // Heal-only gating (legacy pHash mode): only mask if recoverable with an existing template.
                 bool healable_now = true;
+                cv::Rect stitch_box = d.box;
                 if (opt.yoloHealOnly) {
                     healable_now = false;
                     if (!is_new) {
@@ -1975,10 +2160,15 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                         if (it != dictRef.end()) {
                             cv::Mat tpl = cv::imread(it->second.path, cv::IMREAD_UNCHANGED);
                             if (!tpl.empty()) {
-                                if (tpl.cols == d.box.width && tpl.rows == d.box.height) {
-                                    healable_now = template_alpha_matches_mask(
-                                        tpl, d.boxMask, d.box, opt.yoloHealMaskIouThr, opt.yoloHealMaskExtraThr
-                                    );
+                                if (tpl.cols != d.box.width || tpl.rows != d.box.height) {
+                                    cv::resize(tpl, tpl, d.box.size(), 0, 0, cv::INTER_NEAREST);
+                                }
+                                int dx = 0, dy = 0;
+                                double extra_ratio = 1e9;
+                                if (best_alpha_mask_offset(tpl, d.boxMask, d.box, /*max_shift=*/2, dx, dy, extra_ratio) &&
+                                    extra_ratio <= (double)opt.yoloHealMaskExtraThr) {
+                                    stitch_box = d.box + cv::Point(dx, dy);
+                                    healable_now = true;
                                 }
                             }
                         }
@@ -1990,15 +2180,31 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                     cv::Vec3b color = opt.yoloClassConsistentColor
                                       ? yolo_class_color(d.classId)
                                       : OfflineProcessor::deterministic_color_from_hash(canon);
-                    OfflineProcessor::paint_mask_color(processed, d.boxMask, d.box, color, opt.paintAlpha);
+                    if (opt.yoloHealOnly) {
+                        const auto &dictRef = processor.getDict();
+                        auto it = dictRef.find(canon);
+                        if (it != dictRef.end()) {
+                            cv::Mat tpl = cv::imread(it->second.path, cv::IMREAD_UNCHANGED);
+                            if (!tpl.empty()) {
+                                if (tpl.cols != stitch_box.width || tpl.rows != stitch_box.height) {
+                                    cv::resize(tpl, tpl, stitch_box.size(), 0, 0, cv::INTER_NEAREST);
+                                }
+                                paint_bbox_alpha_color(processed, tpl, stitch_box, color);
+                            }
+                        }
+                    } else {
+                        OfflineProcessor::paint_mask_color(processed, d.boxMask, d.box, color, opt.paintAlpha);
+                    }
+                    det_masked[di] = 1;
+                    det_stitch_boxes[di] = stitch_box;
 
                     if (seiOut.is_open()) {
                         SEIRegion r{};
                         r.id = (uint32_t)sei_regions.size();
-                        r.x = (uint32_t)std::max(0, d.box.x);
-                        r.y = (uint32_t)std::max(0, d.box.y);
-                        r.w = (uint32_t)std::max(0, d.box.width);
-                        r.h = (uint32_t)std::max(0, d.box.height);
+                        r.x = (uint32_t)std::max(0, stitch_box.x);
+                        r.y = (uint32_t)std::max(0, stitch_box.y);
+                        r.w = (uint32_t)std::max(0, stitch_box.width);
+                        r.h = (uint32_t)std::max(0, stitch_box.height);
                         r.flags = is_new ? 0 : 1; // 0=new, 1=reference
                         r.class_id = (uint8_t)std::max(0, std::min(255, d.classId)); // class id
                         r.path = canon; // key for stitching (canonical hash)
@@ -2016,11 +2222,16 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
         recovered = processed.clone();
 
         // Pass 2: apply recovery overlays onto recovered frame (client reconstruction)
+        // IMPORTANT: if a region was not masked on the server, the client should not waste
+        // work stitching it (and it could even introduce artifacts).
         auto t_rec0 = std::chrono::steady_clock::now();
         for (size_t di = 0; di < dets.size(); ++di) {
             const auto &d = dets[di];
             if (d.confidence < opt.confThreshold) continue;
             if (d.boxMask.empty()) continue;
+            if (!opt.pixelMode) {
+                if (di < det_masked.size() && det_masked[di] == 0) continue;
+            }
 
             if (opt.pixelMode) {
                 cv::Mat tpl_rgba = get_pixel_template_rgba_for_detection(d);
@@ -2037,12 +2248,18 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                     uint32_t use_id = tid;
                     if (is_new_for_client) {
                         // Fallback to last recoverable template for this class if bbox overlaps enough.
-                        auto itLast = last_client_tpl_by_class.find(d.classId);
-                        if (itLast != last_client_tpl_by_class.end() && itLast->second.valid) {
-                            float iou = iou_rect(itLast->second.box, d.box);
-                            if (iou >= 0.5f) {
-                                use_id = itLast->second.id;
-                                is_new_for_client = false; // treat as recoverable via fallback
+                        auto itVec = last_client_tpls_by_class.find(d.classId);
+                        if (itVec != last_client_tpls_by_class.end()) {
+                            float best_iou = 0.0f;
+                            uint32_t best_id = 0;
+                            for (const auto &lc : itVec->second) {
+                                if (!lc.valid) continue;
+                                float iou = iou_rect(lc.box, d.box);
+                                if (iou > best_iou) { best_iou = iou; best_id = lc.id; }
+                            }
+                            if (best_id != 0 && best_iou >= 0.5f) {
+                                use_id = best_id;
+                                is_new_for_client = false; // recoverable via fallback
                             } else {
                                 continue; // no good fallback, keep masked pixels
                             }
@@ -2056,17 +2273,31 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                     const auto &tpl = latent_bank[itIdx->second];
                     cv::Mat img = cv::imread(tpl.path, cv::IMREAD_UNCHANGED);
                     if (!img.empty()) {
-                        if (img.cols != d.box.width || img.rows != d.box.height) {
-                            cv::resize(img, img, d.box.size(), 0, 0, cv::INTER_NEAREST);
+                        cv::Rect box = (di < det_stitch_boxes.size() && det_stitch_boxes[di].area() > 0) ? det_stitch_boxes[di] : d.box;
+                        if (img.cols != box.width || img.rows != box.height) {
+                            cv::resize(img, img, box.size(), 0, 0, cv::INTER_NEAREST);
                         }
-                        overlay_template_rgba(recovered, img, d.box);
+                        overlay_template_rgba(recovered, img, box);
 
                         // Update last client template for this class (recoverable/cached)
+                        auto &vec = last_client_tpls_by_class[d.classId];
+                        size_t best_idx = (size_t)-1;
+                        float best_iou = 0.0f;
+                        for (size_t li = 0; li < vec.size(); ++li) {
+                            if (!vec[li].valid) continue;
+                            float iou = iou_rect(vec[li].box, box);
+                            if (iou > best_iou) { best_iou = iou; best_idx = li; }
+                        }
                         LastClientTpl lc;
-                        lc.box = d.box;
+                        lc.box = box;
                         lc.id = use_id;
                         lc.valid = true;
-                        last_client_tpl_by_class[d.classId] = std::move(lc);
+                        if (best_idx != (size_t)-1 && best_iou >= 0.3f) {
+                            vec[best_idx] = std::move(lc);
+                        } else {
+                            vec.push_back(std::move(lc));
+                            if (vec.size() > 8) vec.erase(vec.begin());
+                        }
                     }
                     continue;
                 }
@@ -2081,10 +2312,11 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                 if (it != dictRef.end()) {
                     cv::Mat tpl = cv::imread(it->second.path, cv::IMREAD_UNCHANGED);
                     if (!tpl.empty()) {
-                        if (tpl.cols != d.box.width || tpl.rows != d.box.height) {
-                            cv::resize(tpl, tpl, d.box.size(), 0, 0, cv::INTER_NEAREST);
+                        cv::Rect box = (di < det_stitch_boxes.size() && det_stitch_boxes[di].area() > 0) ? det_stitch_boxes[di] : d.box;
+                        if (tpl.cols != box.width || tpl.rows != box.height) {
+                            cv::resize(tpl, tpl, box.size(), 0, 0, cv::INTER_NEAREST);
                         }
-                        overlay_template_rgba(recovered, tpl, d.box);
+                        overlay_template_rgba(recovered, tpl, box);
                     }
                 }
             }
@@ -2094,7 +2326,8 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
 
         if (seiOut.is_open()) {
             uint64_t pts = (uint64_t)frameIdx;
-            std::vector<uint8_t> payload = build_msk1_payload((uint64_t)frameIdx, pts, sei_regions, /*version=*/3);
+            uint8_t frame_flags = sei_regions.empty() ? 0 : 1; // 0=raw, 1=ref
+            std::vector<uint8_t> payload = build_msk1_payload((uint64_t)frameIdx, pts, sei_regions, /*version=*/4, frame_flags);
             uint32_t len = (uint32_t)payload.size();
             seiOut.write(reinterpret_cast<const char*>(&len), sizeof(len));
             if (len) seiOut.write(reinterpret_cast<const char*>(payload.data()), len);

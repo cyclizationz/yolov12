@@ -53,8 +53,9 @@ void print_usage(const char* program_name) {
               << "  --latent-motion-boost <int> Boost window frames (default: 6)\n"
               << "  --dump-latents[=PATH]   Dump per-frame latent embeddings to JSONL (default: <outDir>/latents.jsonl)\n"
               << "  --yolo-heal-only        YOLO mode: only mask regions recoverable from client templates\n"
-              << "  --yolo-heal-iou <f>     YOLO heal-only: require IoU(template_alpha, current_mask) >= f (default: 0.995)\n"
-              << "  --yolo-heal-extra <f>   YOLO heal-only: allow alpha spill outside mask <= f (default: 0.005)\n"
+              << "  --yolo-heal-iou <f>     YOLO heal-only: require IoU(template_alpha, current_mask) >= f (default: 0.0 disabled)\n"
+              << "  --yolo-heal-extra <f>   YOLO heal-only: allow alpha spill outside mask <= f (default: 0.02)\n"
+              << "  --max-frames <n>        Stop after N frames (default: -1 unlimited)\n"
               << "  --cpu                   Force CPU inference (explicit flag)\n"
               << "  -h                      Show this help message\n";
 }
@@ -107,6 +108,7 @@ int main(int argc, char* argv[]) {
         {"yolo-heal-only", no_argument, 0, 'H'},
         {"yolo-heal-iou", required_argument, 0, 'J'},
         {"yolo-heal-extra", required_argument, 0, 'Q'},
+        {"max-frames", required_argument, 0, 'N'},
         {0, 0, 0, 0}
     };
 
@@ -240,6 +242,9 @@ int main(int argc, char* argv[]) {
                 break;
             case 'Q':
                 opt.yoloHealMaskExtraThr = std::stof(optarg);
+                break;
+            case 'N':
+                opt.maxFrames = std::stoi(optarg);
                 break;
             case 'h':
                 print_usage(argv[0]);

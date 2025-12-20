@@ -52,8 +52,10 @@ struct OfflineOptions {
     // - Reused templates must pass a mask agreement check vs current mask inside bbox.
     // - If not recoverable, we keep original pixels (do not paint mask, do not emit SEI region).
     bool yoloHealOnly = false;
-    float yoloHealMaskIouThr = 0.995f;   // IoU(template_alpha, current_mask) within bbox
-    float yoloHealMaskExtraThr = 0.005f; // allow small alpha "extra" outside current mask (ratio)
+    // Defaults are intentionally not ultra-strict because real segmentations have 1-2px jitter.
+    // Set to 0 to disable IoU gating and rely on spill control (extra_thr) instead.
+    float yoloHealMaskIouThr = 0.0f;     // IoU(template_alpha, current_mask) within bbox
+    float yoloHealMaskExtraThr = 0.02f;  // allow small alpha "extra" outside current mask (ratio)
 
     // Experiment support: dump per-frame latent embeddings to analyze similarity/thresholds offline.
     bool dumpLatents = false;

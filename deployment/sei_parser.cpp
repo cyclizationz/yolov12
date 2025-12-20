@@ -17,6 +17,11 @@ bool parse_msk1_payload(const uint8_t* data, size_t size, ParsedSEI &out) {
     uint16_t ver_be; memcpy(&ver_be, p, 2); p += 2; out.version = ntohs(ver_be);
     uint64_t frame_be; memcpy(&frame_be, p, 8); p += 8; out.frame_counter = ntohll_u64(frame_be);
     uint64_t pts_be; memcpy(&pts_be, p, 8); p += 8; out.pts = ntohll_u64(pts_be);
+    out.frame_flags = 0;
+    if (out.version >= 4) {
+        if ((size_t)(p - data) + 1 > size) return false;
+        out.frame_flags = *p++;
+    }
     uint32_t nr_be; memcpy(&nr_be, p, 4); p += 4; uint32_t N = ntohl(nr_be);
     out.regions.clear(); out.regions.reserve(N);
     for (uint32_t i=0;i<N;i++) {
@@ -48,7 +53,8 @@ bool parse_msk1_payload(const uint8_t* data, size_t size, ParsedSEI &out) {
 
 std::vector<uint8_t> build_msk1_payload(uint64_t frame_counter, uint64_t pts,
                                         const std::vector<SEIRegion>& regions,
-                                        uint16_t version) {
+                                        uint16_t version,
+                                        uint8_t frame_flags) {
     uint32_t magic = htonl(0x4D534B31u); // 'MSK1'
     uint16_t ver   = htons(version);
     auto htonll_local = [](uint64_t v){
@@ -62,6 +68,7 @@ std::vector<uint8_t> build_msk1_payload(uint64_t frame_counter, uint64_t pts,
     uint64_t pts_be = htonll_local(pts);
     uint32_t nr_be = htonl((uint32_t)regions.size());
     size_t payload_len = 4+2+8+8+4;
+    if (version >= 4) payload_len += 1; // frame_flags
     for (auto &r: regions) {
         size_t L = r.path.size(); if (L>255) L=255;
         if (version >= 3)
@@ -71,7 +78,9 @@ std::vector<uint8_t> build_msk1_payload(uint64_t frame_counter, uint64_t pts,
     }
     std::vector<uint8_t> buf(payload_len);
     uint8_t *p = buf.data();
-    memcpy(p, &magic,4); p+=4; memcpy(p,&ver,2); p+=2; memcpy(p,&f_be,8); p+=8; memcpy(p,&pts_be,8); p+=8; memcpy(p,&nr_be,4); p+=4;
+    memcpy(p, &magic,4); p+=4; memcpy(p,&ver,2); p+=2; memcpy(p,&f_be,8); p+=8; memcpy(p,&pts_be,8); p+=8;
+    if (version >= 4) { *p++ = frame_flags; }
+    memcpy(p,&nr_be,4); p+=4;
     for (auto &r: regions) {
         uint32_t be32; size_t L = r.path.size(); if (L>255) L=255;
         be32 = htonl(r.id); memcpy(p,&be32,4); p+=4;
