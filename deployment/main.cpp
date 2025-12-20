@@ -52,6 +52,9 @@ void print_usage(const char* program_name) {
               << "  --latent-motion-scale <f> Motion trigger area ratio delta (default: 0.25)\n"
               << "  --latent-motion-boost <int> Boost window frames (default: 6)\n"
               << "  --dump-latents[=PATH]   Dump per-frame latent embeddings to JSONL (default: <outDir>/latents.jsonl)\n"
+              << "  --yolo-heal-only        YOLO mode: only mask regions recoverable from client templates\n"
+              << "  --yolo-heal-iou <f>     YOLO heal-only: require IoU(template_alpha, current_mask) >= f (default: 0.995)\n"
+              << "  --yolo-heal-extra <f>   YOLO heal-only: allow alpha spill outside mask <= f (default: 0.005)\n"
               << "  --cpu                   Force CPU inference (explicit flag)\n"
               << "  -h                      Show this help message\n";
 }
@@ -101,6 +104,9 @@ int main(int argc, char* argv[]) {
         {"latent-motion-scale", required_argument, 0, 'S'},
         {"latent-motion-boost", required_argument, 0, 'B'},
         {"dump-latents", optional_argument, 0, 'D'},
+        {"yolo-heal-only", no_argument, 0, 'H'},
+        {"yolo-heal-iou", required_argument, 0, 'J'},
+        {"yolo-heal-extra", required_argument, 0, 'Q'},
         {0, 0, 0, 0}
     };
 
@@ -225,6 +231,15 @@ int main(int argc, char* argv[]) {
             case 'D':
                 opt.dumpLatents = true;
                 if (optarg) opt.latentsOutPath = optarg;
+                break;
+            case 'H':
+                opt.yoloHealOnly = true;
+                break;
+            case 'J':
+                opt.yoloHealMaskIouThr = std::stof(optarg);
+                break;
+            case 'Q':
+                opt.yoloHealMaskExtraThr = std::stof(optarg);
                 break;
             case 'h':
                 print_usage(argv[0]);

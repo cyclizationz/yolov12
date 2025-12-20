@@ -1207,6 +1207,64 @@ static void overlay_template_rgba(cv::Mat &dst_bgr, const cv::Mat &rgba, const c
     }
 }
 
+// -----------------------------------------------------------------------------
+// YOLO reliability: template-mask agreement check
+// -----------------------------------------------------------------------------
+// If we paint pixels according to the current segmentation mask, the client can
+// only heal them perfectly if the template alpha (after resize) matches that
+// mask inside the bbox. Otherwise we see residual mask-color "edges" (or
+// overwrite unmasked background pixels).
+//
+// Returns true if template alpha is a near-perfect match for current mask.
+static bool template_alpha_matches_mask(
+    const cv::Mat &tpl_rgba_resized,
+    const cv::Mat &full_mask_u8,
+    const cv::Rect &bbox,
+    float iou_thr,
+    float extra_thr
+) {
+    if (tpl_rgba_resized.empty() || full_mask_u8.empty()) return false;
+    if (tpl_rgba_resized.type() != CV_8UC4) return false;
+
+    cv::Rect safe = bbox & cv::Rect(0, 0, full_mask_u8.cols, full_mask_u8.rows);
+    if (safe.area() <= 0) return false;
+    if (tpl_rgba_resized.cols != bbox.width || tpl_rgba_resized.rows != bbox.height) return false;
+
+    uint64_t inter = 0, uni = 0, extra = 0, miss = 0;
+
+    // Iterate only on visible part; map dst coords to template coords.
+    int dx0 = safe.x - bbox.x;
+    int dy0 = safe.y - bbox.y;
+
+    for (int y = 0; y < safe.height; ++y) {
+        int my = safe.y + y;
+        const uchar *mrow = full_mask_u8.ptr<uchar>(my);
+        const cv::Vec4b *trow = tpl_rgba_resized.ptr<cv::Vec4b>(dy0 + y);
+        for (int x = 0; x < safe.width; ++x) {
+            int mx = safe.x + x;
+            bool m = (mrow[mx] != 0);
+            bool t = (trow[dx0 + x][3] != 0);
+            if (m && t) inter++;
+            if (m || t) uni++;
+            if (t && !m) extra++;
+            if (m && !t) miss++;
+        }
+    }
+
+    if (uni == 0) return false;
+    double iou = (double)inter / (double)uni;
+    // extra ratio relative to template alpha area; if template is empty, reject
+    double t_area = (double)(inter + extra);
+    if (t_area <= 0.0) return false;
+    double extra_ratio = (double)extra / t_area;
+    // miss ratio relative to mask area; if mask empty, reject
+    double m_area = (double)(inter + miss);
+    if (m_area <= 0.0) return false;
+    double miss_ratio = (double)miss / m_area;
+
+    return (iou >= iou_thr) && (extra_ratio <= extra_thr) && (miss_ratio <= extra_thr);
+}
+
 // --- Quality metrics (PSNR / SSIM) -----------------------------------------
 
 // Compute PSNR between two images
@@ -1426,6 +1484,9 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
     // Latent matching cost breakdown
     double latent_search_ms_sum = 0.0;   // bank scanning cost
     double latent_mint_io_ms_sum = 0.0;  // imwrite cost for newly minted templates
+
+    // Reliability stats
+    uint64_t yolo_heal_skipped = 0; // regions not masked because not perfectly recoverable
     
     int frameIdx = 0;
     cv::Mat frame;
@@ -1742,6 +1803,29 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                         latent_reuse_cos_sims.push_back(bestSim);
                     }
 
+                    // Heal-only gating: only mask if client can perfectly recover with an existing template.
+                    // - New templates are considered not yet available on client.
+                    // - Reused templates must have alpha mask matching current segmentation mask.
+                    bool healable_now = true;
+                    if (opt.yoloHealOnly) {
+                        healable_now = false;
+                        if (chosen_id != 0 && !force_mint) {
+                            auto itIdx = latent_id_to_index.find(chosen_id);
+                            if (itIdx != latent_id_to_index.end()) {
+                                const auto &tpl = latent_bank[itIdx->second];
+                                cv::Mat img = cv::imread(tpl.path, cv::IMREAD_UNCHANGED);
+                                if (!img.empty()) {
+                                    // For perfect healing, forbid template rescaling (resizing introduces mismatch).
+                                    if (img.cols == d.box.width && img.rows == d.box.height) {
+                                        healable_now = template_alpha_matches_mask(
+                                            img, d.boxMask, d.box, opt.yoloHealMaskIouThr, opt.yoloHealMaskExtraThr
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     if (chosen_id == 0 || force_mint) {
                         // Mint new template_id and save RGBA template
                         chosen_id = next_template_id++;
@@ -1799,21 +1883,25 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                     auto t_dict1 = std::chrono::steady_clock::now();
                     dict_ms += std::chrono::duration<double, std::milli>(t_dict1 - t_dict0).count();
 
-                    // Paint masked stream
-                    cv::Vec3b color = opt.yoloClassConsistentColor ? yolo_class_color(d.classId) : cv::Vec3b(0, 255, 0);
-                    OfflineProcessor::paint_mask_color(processed, d.boxMask, d.box, color, opt.paintAlpha);
+                    // Paint masked stream only when healable (or when heal-only is disabled).
+                    if (!opt.yoloHealOnly || healable_now) {
+                        cv::Vec3b color = opt.yoloClassConsistentColor ? yolo_class_color(d.classId) : cv::Vec3b(0, 255, 0);
+                        OfflineProcessor::paint_mask_color(processed, d.boxMask, d.box, color, opt.paintAlpha);
 
-                    if (seiOut.is_open()) {
-                        SEIRegion r{};
-                        r.id = chosen_id; // template_id (stable across frames)
-                        r.x = (uint32_t)std::max(0, d.box.x);
-                        r.y = (uint32_t)std::max(0, d.box.y);
-                        r.w = (uint32_t)std::max(0, d.box.width);
-                        r.h = (uint32_t)std::max(0, d.box.height);
-                        r.flags = is_new ? 0 : 1;
-                        r.class_id = (uint8_t)std::max(0, std::min(255, d.classId));
-                        r.path.clear(); // no client hashing; id is enough
-                        sei_regions.push_back(std::move(r));
+                        if (seiOut.is_open()) {
+                            SEIRegion r{};
+                            r.id = chosen_id; // template_id (stable across frames)
+                            r.x = (uint32_t)std::max(0, d.box.x);
+                            r.y = (uint32_t)std::max(0, d.box.y);
+                            r.w = (uint32_t)std::max(0, d.box.width);
+                            r.h = (uint32_t)std::max(0, d.box.height);
+                            r.flags = is_new ? 0 : 1;
+                            r.class_id = (uint8_t)std::max(0, std::min(255, d.classId));
+                            r.path.clear(); // no client hashing; id is enough
+                            sei_regions.push_back(std::move(r));
+                        }
+                    } else {
+                        yolo_heal_skipped++;
                     }
                     continue;
                 }
@@ -1877,23 +1965,47 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                 lt.valid = true;
                 last_tpl_by_class[d.classId] = std::move(lt);
 
-                // Visualization (server masked stream)
-                cv::Vec3b color = opt.yoloClassConsistentColor
-                                  ? yolo_class_color(d.classId)
-                                  : OfflineProcessor::deterministic_color_from_hash(canon);
-                OfflineProcessor::paint_mask_color(processed, d.boxMask, d.box, color, opt.paintAlpha);
+                // Heal-only gating (legacy pHash mode): only mask if recoverable with an existing template.
+                bool healable_now = true;
+                if (opt.yoloHealOnly) {
+                    healable_now = false;
+                    if (!is_new) {
+                        const auto &dictRef = processor.getDict();
+                        auto it = dictRef.find(canon);
+                        if (it != dictRef.end()) {
+                            cv::Mat tpl = cv::imread(it->second.path, cv::IMREAD_UNCHANGED);
+                            if (!tpl.empty()) {
+                                if (tpl.cols == d.box.width && tpl.rows == d.box.height) {
+                                    healable_now = template_alpha_matches_mask(
+                                        tpl, d.boxMask, d.box, opt.yoloHealMaskIouThr, opt.yoloHealMaskExtraThr
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
 
-                if (seiOut.is_open()) {
-                    SEIRegion r{};
-                    r.id = (uint32_t)sei_regions.size();
-                    r.x = (uint32_t)std::max(0, d.box.x);
-                    r.y = (uint32_t)std::max(0, d.box.y);
-                    r.w = (uint32_t)std::max(0, d.box.width);
-                    r.h = (uint32_t)std::max(0, d.box.height);
-                    r.flags = is_new ? 0 : 1; // 0=new, 1=reference
-                    r.class_id = (uint8_t)std::max(0, std::min(255, d.classId)); // class id
-                    r.path = canon; // key for stitching (canonical hash)
-                    sei_regions.push_back(std::move(r));
+                if (!opt.yoloHealOnly || healable_now) {
+                    // Visualization (server masked stream)
+                    cv::Vec3b color = opt.yoloClassConsistentColor
+                                      ? yolo_class_color(d.classId)
+                                      : OfflineProcessor::deterministic_color_from_hash(canon);
+                    OfflineProcessor::paint_mask_color(processed, d.boxMask, d.box, color, opt.paintAlpha);
+
+                    if (seiOut.is_open()) {
+                        SEIRegion r{};
+                        r.id = (uint32_t)sei_regions.size();
+                        r.x = (uint32_t)std::max(0, d.box.x);
+                        r.y = (uint32_t)std::max(0, d.box.y);
+                        r.w = (uint32_t)std::max(0, d.box.width);
+                        r.h = (uint32_t)std::max(0, d.box.height);
+                        r.flags = is_new ? 0 : 1; // 0=new, 1=reference
+                        r.class_id = (uint8_t)std::max(0, std::min(255, d.classId)); // class id
+                        r.path = canon; // key for stitching (canonical hash)
+                        sei_regions.push_back(std::move(r));
+                    }
+                } else {
+                    yolo_heal_skipped++;
                 }
             }
         }
@@ -2081,6 +2193,8 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
     report["avg_recovered_psnr"] = avg_rec_psnr;
     report["timing_enabled"] = opt.recordTiming;
     report["latent_key_enabled"] = opt.yoloLatentKey;
+    report["yolo_heal_only"] = opt.yoloHealOnly;
+    report["yolo_heal_skipped_regions"] = yolo_heal_skipped;
     if (opt.yoloLatentKey) {
         report["latent_bank_size"] = (uint64_t)latent_bank.size();
         report["latent_cosine_threshold"] = opt.latentCosineThreshold;

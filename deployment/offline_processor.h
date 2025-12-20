@@ -43,6 +43,18 @@ struct OfflineOptions {
     float latentMotionScaleThr = 0.25f;  // trigger boost if area ratio differs by > this (e.g. 0.25 => 25%)
     int latentMotionBoostFrames = 6;     // boost window length in frames
 
+    // Reliability: only mask when the region is recoverable with client-known templates.
+    // This avoids green-edge artifacts when a reused template's alpha mask doesn't match
+    // the current frame's segmentation mask.
+    //
+    // Policy when enabled:
+    // - New templates (minted this frame) are treated as NOT recoverable (client may not have them yet).
+    // - Reused templates must pass a mask agreement check vs current mask inside bbox.
+    // - If not recoverable, we keep original pixels (do not paint mask, do not emit SEI region).
+    bool yoloHealOnly = false;
+    float yoloHealMaskIouThr = 0.995f;   // IoU(template_alpha, current_mask) within bbox
+    float yoloHealMaskExtraThr = 0.005f; // allow small alpha "extra" outside current mask (ratio)
+
     // Experiment support: dump per-frame latent embeddings to analyze similarity/thresholds offline.
     bool dumpLatents = false;
     std::string latentsOutPath = ""; // defaults to <outDir>/latents.jsonl when enabled

@@ -27,6 +27,21 @@ Notes:
 - The FPS clip has **very small net bandwidth gain** despite high visual quality, suggesting the masked regions are not large enough (or not compressible enough) to dominate bitrate.
 - “Worse%” is the fraction of frames where the masked bitstream packet is larger than baseline; it’s a useful indicator that masking sometimes hurts encoder prediction for that sequence.
 
+### Reliability mode: “only send what the client can understand”
+
+We added an optional **YOLO heal-only** policy that makes masking conservative:
+
+- The server **only masks** a region if it can be reconstructed from an **already-known template** (client storage).
+- Additionally, the server checks that the **template alpha mask matches the current segmentation mask** inside the bbox (near-perfect IoU, low spill). This prevents green-edge artifacts and background overwrite.
+- If the check fails, the server keeps **original pixels** for that region (equivalent to “send original frame content” for what cannot be healed).
+
+CLI flags:
+- `--yolo-heal-only`
+- `--yolo-heal-iou` (default 0.995)
+- `--yolo-heal-extra` (default 0.005)
+
+Tradeoff: this can reduce bitrate savings (sometimes even negative) because many regions are deemed not safely healable.
+
 ### Pixel game (best): Kalman + band selection + optical flow
 
 **Config**: `deployment/outputs/pixel_kalman_band2_flow_v1/`
