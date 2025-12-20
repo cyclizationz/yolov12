@@ -1,0 +1,14 @@
+# FC5 FPS dataset (YOLO segmentation)
+#
+# Dataset root is outside the repo to keep training data out of git.
+# Labels are expected in YOLO-seg polygon format:
+#   cls x1 y1 x2 y2 ... (normalized to [0,1])
+
+path: /home/tiehangz/proj/datasets/fps/fc5
+train: train/images
+val: val/images
+
+names:
+  0: gun
+
+
