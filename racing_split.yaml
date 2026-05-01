@@ -1,0 +1,8 @@
+path: /home/tiehangz/proj/datasets/racing
+train: train/images
+val: val/images
+test: images_900
+
+names:
+  0: cockpit
+

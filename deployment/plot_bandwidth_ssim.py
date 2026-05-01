@@ -9,28 +9,62 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-def ffprobe_frame_sizes(video_path: Path):
+def ffprobe_packets(video_path: Path):
     """
-    Use ffprobe to get per-frame packet sizes (bytes) before decoding.
+    Use ffprobe to get packet PTS times and packet sizes (bytes) for the video stream.
+    For MP4/H.264 this is typically one packet per coded picture (access unit).
     """
     cmd = [
         "ffprobe",
         "-v", "error",
         "-select_streams", "v:0",
-        "-show_entries", "frame=pkt_size",
+        "-show_packets",
+        "-show_entries", "packet=pts_time,size",
         "-of", "json",
         str(video_path),
     ]
     out = subprocess.check_output(cmd, text=True)
     data = json.loads(out)
-    sizes = []
-    for fr in data.get("frames", []):
-        v = fr.get("pkt_size")
-        if v is None:
+    packets = []
+    for p in data.get("packets", []) or []:
+        pts_t = p.get("pts_time")
+        sz = p.get("size")
+        if pts_t is None or sz is None:
             continue
-        # ffprobe returns pkt_size as string
-        sizes.append(int(v))
-    return sizes
+        packets.append((float(pts_t), int(sz)))
+    return packets
+
+
+def align_packets_by_time(a, b, tol_ms: float = 6.0):
+    """
+    Align two (pts_time, size) lists by pts_time with a tolerance (ms).
+    This is robust when the two MP4s differ slightly in fps/timebase metadata.
+    Returns (aligned_pts_time, a_sizes, b_sizes).
+    """
+    tol = tol_ms / 1000.0
+    # Sort by pts_time so we align in presentation order (B-frames can make pts_time non-monotonic in file order).
+    a = sorted([(t, s) for (t, s) in a if t is not None], key=lambda x: x[0])
+    b = sorted([(t, s) for (t, s) in b if t is not None], key=lambda x: x[0])
+    i = 0
+    j = 0
+    ts = []
+    asz = []
+    bsz = []
+    while i < len(a) and j < len(b):
+        t0, s0 = a[i]
+        t1, s1 = b[j]
+        dt = t0 - t1
+        if abs(dt) <= tol:
+            ts.append(t0)
+            asz.append(s0)
+            bsz.append(s1)
+            i += 1
+            j += 1
+        elif dt < 0:
+            i += 1
+        else:
+            j += 1
+    return ts, asz, bsz
 
 
 def main():
@@ -59,11 +93,14 @@ def main():
             f"Run Yolov12Deployment first."
         )
 
-    # 1) Per-frame bandwidth (bytes) before decoding
-    print("Running ffprobe on baseline (no masking) video...")
-    baseline_bytes = ffprobe_frame_sizes(baseline_video)
-    print("Running ffprobe on masked (segmented) video...")
-    masked_bytes = ffprobe_frame_sizes(masked_video)
+    # 1) Per-frame bandwidth (bytes) as packet sizes, aligned by PTS time
+    print("Running ffprobe on baseline (no masking) video packets...")
+    baseline_pkts = ffprobe_packets(baseline_video)
+    print("Running ffprobe on masked (segmented) video packets...")
+    masked_pkts = ffprobe_packets(masked_video)
+    pts_time, baseline_bytes, masked_bytes = align_packets_by_time(baseline_pkts, masked_pkts, tol_ms=6.0)
+    if not baseline_bytes or not masked_bytes:
+        raise RuntimeError("Failed to align packet streams by PTS time; check ffprobe output and timestamps.")
 
     # 2) Load per-frame SSIM from C++ report
     if not report_json.exists():
@@ -89,6 +126,7 @@ def main():
     n = min(len(baseline_bytes), len(masked_bytes), len(ssim_values), len(psnr_values), len(rec_ssim_values), len(rec_psnr_values))
     baseline_bytes = baseline_bytes[:n]
     masked_bytes = masked_bytes[:n]
+    pts_time = pts_time[:n]
     ssim_values = ssim_values[:n]
     psnr_values = psnr_values[:n]
     rec_ssim_values = rec_ssim_values[:n]
@@ -167,7 +205,7 @@ def main():
     ax1.set_ylabel(f"bytes per frame ({window}-frame average)")
     ax1.grid(True, which="both", axis="both", linestyle="--", alpha=0.3)
     ax1.legend(loc="upper right")
-    plt.title(f"Bandwidth ({window}-frame Averages) – mean saving={mean_saving*100:.2f}%")
+    plt.title(f"Bandwidth ({window}-frame Averages) – mean saving={mean_saving*100:.2f}% (PTS-aligned packets)")
     plt.tight_layout()
     suffix = f"_{args.tag}" if args.tag else ""
     out_band = out_dir / f"bandwidth{suffix}.png"
@@ -197,7 +235,7 @@ def main():
     ax_p.grid(True, axis="y", linestyle="--", alpha=0.3)
     ax_p.legend(loc="lower right")
 
-    plt.suptitle(f"Quality Metrics (SSIM & PSNR, {window}-frame Averages) – Racing Video")
+    plt.suptitle(f"Quality Metrics (SSIM & PSNR, {window}-frame Averages)")
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     out_qual = out_dir / f"quality{suffix}.png"
     fig2.savefig(out_qual, dpi=150)

@@ -1,0 +1,100 @@
+\section{Evaluation Methodology and Results}
+\label{sec:evaluation}
+
+\parab{Measurement and Offline Prototype}
+We adopt a two-pass offline methodology to quantify effects while iterating on efficiency. The server pass encodes two aligned streams with identical codec settings: a baseline (no masking, no SEI) and a masked stream (masking + MSK1 SEI). The client pass decodes the masked stream, parses SEI, stitches templates, and emits a reconstructed video. Metrics include: (i) bitstream savings from total packet bytes and per-frame bytes separated by presenting timestamps (baseline vs. masked), (ii) decoder throughput (frames/second), (iii) SEI parsing statistics (frames with SEI, regions parsed, payload bytes), and (iv) quality (PSNR/SSIM/VMAF) of reconstructed vs. baseline. We use this offline prototype as a working reference because the current decoder throughput and parsing efficiency do not yet meet deployment targets; the setup allows rapid profiling and validation without altering the core method or SEI schema.
+
+\subsection{Metrics}
+\label{sec:evaluation:metrics}
+
+\parab{Rate reduction.}
+We measure rate using coded video payload bytes extracted from the video stream’s packet sizes. For per-frame analysis, packets are paired by presentation timestamps (PTS) in presentation order to avoid misalignment caused by B-frame reordering.
+
+\parab{Metadata overhead and schema pressure.}
+We report MSK1 overhead as \emph{payload+framing} bytes per frame, derived from the bytestream size divided by the number of frames. To validate that metadata remains compact, we additionally report (i) the fraction of frames marked as reference frames (frames with at least one region), (ii) regions per frame (mean/p50/p90/max), and (iii) the fraction of MSK1 payload consumed by string fields (when present).
+
+\parab{Client-visible quality.}
+We evaluate perceptual quality only on the client-visible reconstruction by reporting VMAF (vmaf\_v0.6.1), SSIM, and PSNR for reconstructed vs.\ baseline frames. We report both averages and tail statistics (p10) to capture worst-case user experience.
+
+\parab{Compute.}
+We report offline per-frame processing time as mean and p95 to quantify the gap to real-time and identify bottlenecks.
+
+\subsection{Results (Encoder-aligned CRF18)}
+\label{sec:evaluation:results:crf18}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lrrrrr}
+\hline
+Game type & Frames & Save@CRF18(\%) & MSK1 (B/frame) & Ref-frame(\%) & Regions/frame (mean/p90) \\
+\hline
+Pixel (Mario) & 187 & 18.32 & 1889.76 & 97.33 & 42.27 / 47 \\
+Racing (FM6)  & 910 & 17.25 & 53.00   & 100.0 & 1.00 / 1 \\
+FPS (FC5, gun-heavy crop) & 120 & 26.29 & 50.93 & 77.50 & 0.87 / 1 \\
+FPS (FC5, full-length; same ROI as crop) & 1366 & -0.12 & 48.90 & 75.70 & 0.78 / 1 \\
+\hline
+\end{tabular}
+\caption{Encoder-aligned rate reduction at CRF18. MSK1 overhead is reported as payload+framing bytes per frame. Ref-frame(\%) is the fraction of frames containing at least one reconstructable region.}
+\label{tab:eval-bw}
+\end{table}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lrrrr}
+\hline
+Game type & VMAF$_{\text{rec}}$ (avg/p10) & SSIM$_{\text{rec}}$ (avg/p10) & PSNR$_{\text{rec}}$ (avg/p10) & ms/frame (mean/p95) \\
+\hline
+Pixel (Mario) & 81.40 / 75.91 & 0.9746 / 0.9716 & 31.27 / 28.85 & 110.00 / 111.75 \\
+Racing (FM6)  & 71.13 / 52.75 & 0.9392 / 0.8938 & 29.41 / 24.69 & 238.55 / 259.08 \\
+FPS (FC5, gun-heavy crop) & 63.05 / 15.32 & 0.8628 / 0.7210 & 33.21 / 10.15 & 159.80 / 172.17 \\
+FPS (FC5, full-length; same ROI as crop) & 63.43 / 23.25 & 0.8860 / 0.7490 & 38.94 / 12.99 & 172.38 / 188.89 \\
+\hline
+\end{tabular}
+\caption{Client-visible reconstruction quality (reconstructed vs.\ baseline) and offline compute cost.}
+\label{tab:eval-quality}
+\end{table}
+
+\parab{Discussion: metadata vs.\ semantic granularity.}
+The pixel-game case produces many small regions per frame (median $\approx45$), and the current MSK1 encoding includes per-region string fields, which account for $\approx47\%$ of payload bytes. This makes metadata a first-order term and motivates compact semantic signaling (dictionary IDs, span/RLE representations, and temporal delta coding). In contrast, the YOLO latent-key runs use a small number of regions per frame and compact identifiers, making metadata overhead negligible relative to the masked video payload.
+
+\parab{Reliability gating: why regions fall back to raw transmission.}
+To validate the server-side heal-only policy, we instrument skip reasons during template selection and mask agreement checks. In a short FC5 heal-only run (120 frames), the majority of skipped regions are attributable to newly minted templates that are not yet client-available, while a small fraction is rejected due to mask-agreement spill (template alpha exceeding the spill threshold). This breakdown supports the intended fail-safe behavior: when the server cannot guarantee deterministic client reconstruction, it transmits original pixels rather than risking visible artifacts.
+
+\parab{Why p10 (not p90) for ``tail'' quality and delay.}
+For reconstruction quality metrics (VMAF, SSIM, PSNR), lower values indicate worse perceptual fidelity, and for latency (ms/frame), higher values indicate worse responsiveness. Therefore we report the \emph{bad tail} using p10 for quality (bottom 10\%) and p95 for compute delay (top 5\%). To make these distributional differences explicit, we also plot empirical CDFs for VMAF, SSIM, PSNR, and ms/frame in Fig.~\ref{fig:cdf-quality-delay}.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.98\linewidth]{record/figures/cdf_quality_delay.png}
+\caption{CDF comparison of reconstructed quality and delay across Pixel, FM6, FC5 gun-heavy crop, and FC5 full-length. Each subplot shows the empirical CDF of per-frame values: VMAF, SSIM, PSNR, and end-to-end ms/frame.}
+\label{fig:cdf-quality-delay}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\begin{minipage}{0.49\linewidth}
+  \centering
+  \includegraphics[width=\linewidth]{Figures/bandwidth_fc5_gunheavy_crf18.png}
+  \vspace{-0.3em}
+  \caption*{(a) Gun-heavy crop (4s)}
+\end{minipage}\hfill
+\begin{minipage}{0.49\linewidth}
+  \centering
+  \includegraphics[width=\linewidth]{record/figures/bandwidth_fc5_full_crf18.png}
+  \vspace{-0.3em}
+  \caption*{(b) Full-length (1366 frames)}
+\end{minipage}
+\caption{FPS/FC5 encoder-aligned CRF18 bandwidth comparison using the same packet-size measurement protocol (PTS-sorted and time-aligned; 10-frame window averages). The gun-heavy crop highlights the intended operating regime where the masked ROI dominates bitrate, while the full-length case shows the dilution effect when maskable regions are sparse or harder for inter-prediction.}
+\label{fig:fc5-crf18-bw-compare}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.98\linewidth]{record/figures/recon_examples_best_worst.png}
+\caption{Qualitative reconstruction examples for Pixel (Mario), Racing (FM6), and FPS (FC5 gun-heavy). For each game, we select a \emph{best} and \emph{worst} frame by a combined (rank-based) score of per-frame reconstruction PSNR and SSIM from \texttt{report.json}. We show baseline and reconstructed frames for both selections to make comparisons index-aligned. Failure modes are visible in the worst cases: in FM6, \emph{dimmed scenes} can reduce detector confidence and change appearance enough to select a poorer/mismatched template, yielding a darker or incorrect overlay; in FC5, \emph{mis-segmentation or mask/bbox misalignment} can cause incorrect region masking/stitching, producing noticeable reconstruction artifacts.}
+\label{fig:recon-best-worst}
+\end{figure}
+
+

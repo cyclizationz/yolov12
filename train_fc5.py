@@ -10,7 +10,7 @@ os.environ["DISABLE_FLASH_ATTN"] = "1"
 
 def main():
     repo_root = Path(__file__).resolve().parent
-    run_name = "yolov12n_fc5_seg_v1"
+    run_name = "yolov12n_fc5_seg_v1_e300_p0"
 
     # Base model
     # In this repo, the pinned weights live under modification/model/
@@ -22,9 +22,10 @@ def main():
     model = YOLO(str(base_pt))
     model.train(
         data=str(repo_root / "fc5.yaml"),
-        epochs=50,
+        epochs=300,
         imgsz=640,
         batch=16,
+        patience=0,  # disable early stopping to guarantee full epoch budget
         project=str(repo_root / "runs" / "segment"),
         name=run_name,
         exist_ok=True,
@@ -39,7 +40,7 @@ def main():
     onnx_path = best.export(
         format="onnx",
         simplify=True,
-        opset=17,
+        opset=18,
         imgsz=640,
         dynamic=False,
     )

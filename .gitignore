@@ -3,8 +3,11 @@
 # Local outputs / artifacts (do not commit)
 outputs/
 deployment/outputs/
+backup/
+compile_commands.json
 
 # Videos (large artifacts)
+video/
 *.mp4
 *.mkv
 *.avi
@@ -37,6 +40,8 @@ runs/
 *.pt
 *.pth
 *.whl
+*.engine
+*.onnx.data
 
 # Docs/binaries often large
 *.pdf
@@ -44,6 +49,7 @@ runs/
 # Deployment bundles / models (download locally)
 deployment/onnxruntime-*/
 deployment/*.onnx
+deployment/models/
 
 # Local experiment templates (generated/symlinks)
 deployment/pixel_kinds_templates/
@@ -58,3 +64,22 @@ modification/*openvino_model/**
 # Office docs / temp locks
 *.docx
 **/.~lock.*
+
+# Third-party/vendor payloads should be fetched locally.
+third_party/
+
+# Generated experiment records are large. Keep lightweight writeup assets and
+# manifests needed by the experiment scripts.
+record/**
+!record/
+!record/**/
+!record/**/*.md
+!record/**/*.tex
+!record/**/*.pdf
+!record/**/manifest/**/*.json
+record/**/figures/**/*.pdf
+record/**/bsp_figs/**/*.pdf
+record/final3/**
+
+# Local experiment output directories; experiment code lives under tools/.
+/experiments/

@@ -24,8 +24,9 @@ else ()
 endif ()
 
 # -------------- ONNXRUNTIME  ------------------#
-set(ONNXRUNTIME_VERSION 1.16.3)
-set(ONNXRUNTIME_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}")
+# Use GPU-enabled ONNX Runtime (for CUDAExecutionProvider)
+set(ONNXRUNTIME_VERSION 1.22.0)
+set(ONNXRUNTIME_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/onnxruntime-linux-x64-gpu-${ONNXRUNTIME_VERSION}")
 
 if (NOT EXISTS ${ONNXRUNTIME_ROOT})
     message(FATAL_ERROR "ONNX Runtime not found at ${ONNXRUNTIME_ROOT}. Please run download_ort.sh")
@@ -45,6 +46,26 @@ set(PROJECT_SOURCES
 )
 
 add_executable(${PROJECT_NAME} ${PROJECT_SOURCES})
+add_executable(${PROJECT_NAME}CurrentBaseline
+    main_current_baseline.cpp
+    inference.cpp
+    inference.h
+    sei_parser.cpp
+    sei_parser.h
+    offline_processor_current_baseline.cpp
+    offline_processor_current_baseline.h
+)
+add_executable(${PROJECT_NAME}Duo
+    main_duo.cpp
+    inference.cpp
+    inference.h
+    sei_parser.cpp
+    sei_parser.h
+    offline_processor.cpp
+    offline_processor.h
+    offline_processor_duo.cpp
+    offline_processor_duo.h
+)
 
 # -------------- SSL ------------------#
 find_package(OpenSSL REQUIRED)
@@ -52,8 +73,18 @@ include_directories(${OPENSSL_INCLUDE_DIR})
 
 # -------------- Linking ------------------#
 target_link_libraries(${PROJECT_NAME} ${OpenCV_LIBS} ${ONNXRUNTIME_ROOT}/lib/libonnxruntime.so OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(${PROJECT_NAME}CurrentBaseline ${OpenCV_LIBS} ${ONNXRUNTIME_ROOT}/lib/libonnxruntime.so OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(${PROJECT_NAME}Duo ${OpenCV_LIBS} ${ONNXRUNTIME_ROOT}/lib/libonnxruntime.so OpenSSL::SSL OpenSSL::Crypto)
+if (USE_CUDA)
+    # CUDA provider is a plugin .so loaded by ORT, but linking it ensures ldd/packaging catches it.
+    target_link_libraries(${PROJECT_NAME} ${ONNXRUNTIME_ROOT}/lib/libonnxruntime_providers_cuda.so)
+    target_link_libraries(${PROJECT_NAME}CurrentBaseline ${ONNXRUNTIME_ROOT}/lib/libonnxruntime_providers_cuda.so)
+    target_link_libraries(${PROJECT_NAME}Duo ${ONNXRUNTIME_ROOT}/lib/libonnxruntime_providers_cuda.so)
+endif ()
 if (USE_CUDA)
     target_link_libraries(${PROJECT_NAME} ${CUDA_LIBRARIES})
+    target_link_libraries(${PROJECT_NAME}CurrentBaseline ${CUDA_LIBRARIES})
+    target_link_libraries(${PROJECT_NAME}Duo ${CUDA_LIBRARIES})
 endif ()
 
 # -------------- Resources ------------------#

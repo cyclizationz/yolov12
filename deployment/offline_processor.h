@@ -3,7 +3,12 @@
 #include <vector>
 #include <unordered_map>
 #include <filesystem>
+#if __has_include(<opencv2/opencv.hpp>)
 #include <opencv2/opencv.hpp>
+#else
+// Some distros install headers under /usr/include/opencv4 without adding include flags to tooling.
+#include <opencv4/opencv2/opencv.hpp>
+#endif
 #include <nlohmann/json.hpp>
 #include "inference.h" // For YOLO_V8
 
@@ -11,24 +16,49 @@
 struct OfflineOptions {
     std::string source; // path to video file
     std::string model = "./yolov12n-seg.onnx"; // Default model path
+    // Full argv for reproducibility (recorded into report.json and often run.log).
+    std::string commandline;
     bool useCuda = false; // Default to CPU
     int cudaID = 0;
-    float confThreshold = 0.25f; // Lowered default confidence threshold
-    float maskThreshold = 0.5f; // Default mask threshold
+    float confThreshold = 0.2f; // Default confidence threshold
+    float maskThreshold = 0.6f; // Default mask threshold
     std::string outDir = "../outputs"; // Output directory for processed video, metadata, etc.
     std::string dictDir = "../outputs/dict"; // Dictionary directory
     std::string reportPath = "../outputs/report.json"; // Report path
     std::string stitchedVideoOut = ""; // evaluation processed output
     std::string originalVideoOut = ""; // evaluation original output
     int maxFrames = -1; // unlimited
-    float paintAlpha = 0.6f; // alpha for deterministic color painting
+    float paintAlpha = 1.0f; // alpha for deterministic color painting (1.0 => solid mask)
     int phashThreshold = 8; // Tolerant matching threshold (Hamming distance on 64-bit phash)
     bool pixelMode = false;  // If true, use template-matching detector for pixel games instead of YOLO
     std::string templatesDir; // Directory containing multiple templates for pixel mode
     bool yoloClassConsistentColor = false; // YOLO mode: paint masks with class-consistent colors (better motion pred)
+    // YOLO matching policy for single-channel offline ablations.
+    // - "latent_key": maskCoeff embedding cosine reuse
+    // - "phash": legacy pHash reuse on cropped ROI
+    // - "iou_only": nearest previous box / IoU-only reuse
+    // - "rgb_hist": nearest-template RGB histogram reuse
+    // Empty keeps backward-compatible behavior: --latent-key => latent_key, otherwise phash.
+    std::string yoloMatcher = "";
+    // Mask paint color for encoder bitrate experiments / visualization.
+    // - "green" (default): legacy constant green
+    // - "black": constant black (often compresses better and avoids edge halos perception)
+    // - "class": use class-consistent palette (equivalent to --yolo-class-color)
+    // - "brown": constant brown
+    // - "dominant": compute dominant color from frame histogram every maskColorPeriod frames
+    // - "rgb:R,G,B": constant color specified in RGB (0-255 each)
+    std::string maskColor = "green";
+    int maskColorPeriod = 200; // only used when maskColor == "dominant"
+    int maskColorR = 0, maskColorG = 255, maskColorB = 0; // used for rgb: and named constants
     bool recordTiming = false; // Record per-frame timing stats into report.json (no extra printing)
     bool yoloLatentKey = false; // YOLO offline simulator: assign template_id via maskCoeff embedding, no hashing on client
     float latentCosineThreshold = 0.95f; // cosine similarity threshold to reuse template_id
+
+    // Build-index mode: prefill template pool (dict + latent_bank.json) from the original stream.
+    // This simulates an offline/first-pass server analysis to populate a stable pool before enabling heal-only.
+    bool buildIndexOnly = false;
+    bool latentNoMint = false;           // disallow minting new templates (match-only run from prebuilt pool)
+    std::string latentBankLoadPath = ""; // optional: load latent bank JSON before processing (defaults to <dictDir>/latent_bank.json if exists)
 
     // Latent-key hybrid sampling policy:
     // - Normally mint a new template every `latentSamplePeriod` frames (e.g. 2 => ~50%).
@@ -57,9 +87,74 @@ struct OfflineOptions {
     float yoloHealMaskIouThr = 0.0f;     // IoU(template_alpha, current_mask) within bbox
     float yoloHealMaskExtraThr = 0.02f;  // allow small alpha "extra" outside current mask (ratio)
 
+    // Heal-only fallback: if strict latent reuse threshold is too strict, allow using the most similar
+    // recently-used latent template within a short temporal window (vision persistence).
+    int yoloHealFallbackWindowFrames = 24;
+    float yoloHealFallbackMinSim = 0.85f;
+    float yoloHealFallbackMinSimI = 0.80f; // more aggressive on GOP boundaries
+    int yoloHealMaxShiftPx = 8;            // max translation (px) to align template to current frame
+    float yoloHealMinMaskCoverage = 0.15f; // require some overlap between seg mask and template alpha after alignment
+    float yoloHealAppearanceMseThr = 700.0f; // masked RGB MSE(template, frame ROI) threshold for acceptance
+
+    // Approximate GOP boundary (I-frame) by frame index modulo gopSize.
+    // NOTE: This is an offline approximation; actual encoder I-frames depend on codec settings.
+    int gopSize = 60;
+
+    // Upper-bound experiment: paint every YOLO mask regardless of template match / healability.
+    // This is ONLY for measuring potential H.264 bitrate savings (recovery will not be correct).
+    bool yoloForceMaskAll = false;
+
     // Experiment support: dump per-frame latent embeddings to analyze similarity/thresholds offline.
     bool dumpLatents = false;
     std::string latentsOutPath = ""; // defaults to <outDir>/latents.jsonl when enabled
+    // When enabled, dump pre-encode original/masked BGR frames to raw cache files.
+    // This is used by offline multi-variant experiments that need to re-encode
+    // alternate timelines without introducing a second lossy encode stage.
+    bool dumpFrameCache = false;
+    // Full-frame temporal hysteresis on the final raw/ref frame-mode decision.
+    // When enabled, a new mode must be requested for N consecutive frames before
+    // the emitted stream flips to that mode.
+    bool frameModeHysteresis = true;
+    int frameModeHysteresisConfirmFrames = 2;
+
+    // ---------------------------------------------------------------------
+    // Controlled encoding (server-side): use FFmpeg/libx264 via stdin pipe.
+    // This avoids OpenCV VideoWriter's opaque encoder settings and lets us
+    // fix GOP/keyint, scenecut, bframes, preset/profile/crf.
+    // ---------------------------------------------------------------------
+    bool useFfmpegEncoder = true;
+    int encGop = 18;                 // keyint / GOP size (frames)
+    int encBFrames = 0;              // bframes
+    int encCrf = 18;                 // CRF quality
+    double encBitrateMbps = 0.0;     // if >0, enable bitrate-targeted mode
+    double encMaxrateMbps = 0.0;     // if <=0 and bitrate mode enabled, defaults to encBitrateMbps
+    double encBufsizeMbits = 0.0;    // if <=0 and bitrate mode enabled, defaults to 2x bitrate
+    std::string encPreset = "superfast";
+    std::string encTune = "zerolatency";
+    std::string encProfile = "baseline";
+    std::string encLevel = "4.2";
+    bool encNoScenecut = true;       // scenecut=0
+    bool encRepeatHeaders = true;    // repeat_headers=1
+    bool encAud = true;              // aud=1 (helps parsers)
+
+    // Encoder codec (ffmpeg -c:v). Default keeps existing behavior.
+    // Examples: libx264, libx265, libsvtav1, libaom-av1
+    std::string encCodec = "libx264";
+
+    // ---------------------------------------------------------------------
+    // Mask fill + feathering (edge-aware masking for bitrate experiments)
+    // ---------------------------------------------------------------------
+    // fillMode:
+    // - "solid": constant color (uses --mask-color or rgb)
+    // - "blur": fill from a heavily blurred version of the original frame
+    // - "bg_ema": fill from a running EMA background estimate (updated only on unmasked pixels)
+    // - "inpaint": boundary-matched fill using OpenCV inpaint (Telea / Navier-Stokes)
+    std::string fillMode = "solid";
+    int featherPx = 0;               // 0 disables feather; else blend to original across band (px)
+    float fillBlurSigma = 8.0f;      // blur fill sigma (pixels) when fillMode=blur
+    float fillBgEmaAlpha = 0.98f;    // EMA alpha for bg_ema (closer to 1 => slower adaptation)
+    int fillInpaintRadius = 5;       // inpaint radius (pixels)
+    std::string fillInpaintMethod = "telea"; // telea|ns
 
     // Pixel mode tracking (Kalman + ROI template matching)
     int pixelBootstrapInterval = 30; // frames between global re-bootstrap
@@ -77,6 +172,7 @@ struct OfflineOptions {
     int pixelNumBands = 2;          // how many horizontal bands to scan per frame
     int pixelBandMinSep = 24;       // minimum separation between band centers (px)
     bool pixelUseFlow = true;       // enable sparse optical flow stabilization
+    bool pixelUseKalman = true;     // enable Kalman prediction/correction in ROI tracking
     int pixelFlowMaxPts = 120;      // max points for LK flow
 
     // Pixel multi-template scanning
@@ -87,6 +183,13 @@ struct OfflineOptions {
     float pixelThrK = 0.85f;        // accept threshold = clamp(pixelThrK * calib_max, pixelThrLo, pixelThrHi)
     float pixelThrLo = 0.30f;
     float pixelThrHi = 0.65f;
+
+    // Pixel template scaling:
+    // - 0.0 (default): auto-calibrate per template from the first frame (may choose !=1.0)
+    // - >0: force a fixed scale for all templates (e.g., 1.0 uses native template size)
+    float pixelForceScale = 0.0f;
+    // Optional safety cap for pixel-template loading. 0 disables the cap.
+    int pixelMaxTemplates = 0;
 };
 
 struct DictItem {

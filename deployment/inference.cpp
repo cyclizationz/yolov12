@@ -1,6 +1,7 @@
 #include "inference.h"
 #include <regex>
 #include <iostream>
+#include <chrono>
 
 #define benchmark
 // #define min(a,b) (((a) < (b)) ? (a) : (b)) // Removed to avoid conflict with std::min
@@ -106,6 +107,22 @@ char* YOLO_V8::CreateSession(DL_INIT_PARAM& iParams) {
             cudaOption.device_id = 0;
             sessionOption.AppendExecutionProvider_CUDA(cudaOption);
         }
+        // Print available providers once for debugging GPU enablement.
+        static bool printedProviders = false;
+        if (!printedProviders) {
+            printedProviders = true;
+            try {
+                auto providers = Ort::GetAvailableProviders();
+                std::cout << "[ORT] Available EPs:";
+                for (const auto &p : providers) std::cout << " " << p;
+                std::cout << std::endl;
+                if (iParams.cudaEnable) {
+                    std::cout << "[ORT] Requested CUDAExecutionProvider." << std::endl;
+                }
+            } catch (...) {
+                // ignore
+            }
+        }
         sessionOption.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
         sessionOption.SetIntraOpNumThreads(iParams.intraOpNumThreads);
         sessionOption.SetLogSeverityLevel(iParams.logSeverityLevel);
@@ -148,11 +165,19 @@ char* YOLO_V8::RunSession(cv::Mat& iImg, std::vector<DL_RESULT>& oResult) {
 
     char* Ret = RET_OK;
     cv::Mat processedImg;
+    // Reset per-call timing breakdown
+    last_preprocess_ms = 0.0;
+    last_infer_ms = 0.0;
+    last_postprocess_ms = 0.0;
+
+    auto t_pre0 = std::chrono::steady_clock::now();
     PreProcess(iImg, imgSize, processedImg);
     if (modelType < 5) // FLOAT32 models
     {
         float* blob = new float[processedImg.total() * 3];
         BlobFromImage(processedImg, blob);
+        auto t_pre1 = std::chrono::steady_clock::now();
+        last_preprocess_ms = std::chrono::duration<double, std::milli>(t_pre1 - t_pre0).count();
         std::vector<int64_t> inputNodeDims = { 1, 3, imgSize.at(0), imgSize.at(1) };
         TensorProcess(starttime_1, iImg, blob, inputNodeDims, oResult);
     }
@@ -161,6 +186,8 @@ char* YOLO_V8::RunSession(cv::Mat& iImg, std::vector<DL_RESULT>& oResult) {
 #ifdef USE_CUDA
         half* blob = new half[processedImg.total() * 3];
         BlobFromImage(processedImg, blob);
+        auto t_pre1 = std::chrono::steady_clock::now();
+        last_preprocess_ms = std::chrono::duration<double, std::milli>(t_pre1 - t_pre0).count();
         std::vector<int64_t> inputNodeDims = { 1, 3, imgSize.at(0), imgSize.at(1) };
         TensorProcess(starttime_1, iImg, blob, inputNodeDims, oResult);
 #endif
@@ -178,12 +205,16 @@ char* YOLO_V8::TensorProcess(clock_t& starttime_1, cv::Mat& iImg, N& blob, std::
 #ifdef benchmark
     clock_t starttime_2 = clock();
 #endif 
+    auto t_infer0 = std::chrono::steady_clock::now();
     auto outputTensor = session->Run(options, inputNodeNames.data(), &inputTensor, 1, outputNodeNames.data(),
         outputNodeNames.size());
+    auto t_infer1 = std::chrono::steady_clock::now();
+    last_infer_ms = std::chrono::duration<double, std::milli>(t_infer1 - t_infer0).count();
 #ifdef benchmark
     clock_t starttime_3 = clock();
 #endif 
 
+    auto t_post0 = std::chrono::steady_clock::now();
     // Output processing
     auto& output0 = outputTensor[0];
     auto output0_info = output0.GetTensorTypeAndShapeInfo();
@@ -328,8 +359,8 @@ char* YOLO_V8::TensorProcess(clock_t& starttime_1, cv::Mat& iImg, N& blob, std::
                 // Resize cropped mask to original image size
                 cv::resize(croppedMask, result.boxMask, iImg.size());
                 
-                // Threshold
-                result.boxMask = result.boxMask > 0.5;
+                // Threshold (honor CLI/configured maskConfidenceThreshold)
+                result.boxMask = result.boxMask > maskConfidenceThreshold;
                 
                 // Mask inside box only
                 cv::Mat finalMask = cv::Mat::zeros(iImg.size(), CV_8UC1);
@@ -349,6 +380,8 @@ char* YOLO_V8::TensorProcess(clock_t& starttime_1, cv::Mat& iImg, N& blob, std::
     default:
         std::cout << "[YOLO_V8]: Not support model type." << std::endl;
     }
+    auto t_post1 = std::chrono::steady_clock::now();
+    last_postprocess_ms = std::chrono::duration<double, std::milli>(t_post1 - t_post0).count();
     return RET_OK;
 }
 

@@ -1,5 +1,6 @@
 #include "offline_processor.h"
 #include <fstream>
+#include <cstdio>
 #include <iostream>
 #include <openssl/evp.h>
 #include <iomanip>
@@ -12,9 +13,100 @@
 #include <array>
 #include <opencv2/dnn.hpp>
 #include "sei_parser.h"
+#include <cstdio>
+#include <sstream>
+#include <csignal>
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
+
+static json ffprobe_input_summary_json(const std::string &path) {
+    // Best-effort: run ffprobe and parse JSON. If ffprobe is missing or parsing fails,
+    // return an empty object.
+    // We keep the full ffprobe JSON so later analysis can decide which fields matter.
+    std::string cmd = "ffprobe -v error -print_format json -show_format -show_streams \"" + path + "\"";
+    FILE *p = popen(cmd.c_str(), "r");
+    if (!p) return json::object();
+    std::string out;
+    char buf[8192];
+    while (true) {
+        size_t n = fread(buf, 1, sizeof(buf), p);
+        if (n > 0) out.append(buf, buf + n);
+        if (n < sizeof(buf)) break;
+    }
+    (void)pclose(p);
+    try {
+        return json::parse(out);
+    } catch (...) {
+        return json::object();
+    }
+}
+
+struct RunLengthStats {
+    int totalFrames{0};
+    int maskedFrames{0};
+    int rawFrames{0};
+    int switchCount{0};
+    double fractionModeSwitches{0.0};
+    double meanRunLength{0.0};
+    double meanMaskedRunLength{0.0};
+    double meanRawRunLength{0.0};
+    int maxMaskedRunLength{0};
+    int maxRawRunLength{0};
+};
+
+static RunLengthStats compute_run_length_stats(const std::vector<int> &flags) {
+    RunLengthStats stats;
+    stats.totalFrames = (int)flags.size();
+    if (flags.empty()) return stats;
+    for (int v : flags) {
+        if (v != 0) stats.maskedFrames++;
+        else stats.rawFrames++;
+    }
+    std::vector<int> allRuns;
+    std::vector<int> maskedRuns;
+    std::vector<int> rawRuns;
+    int cur = flags.front();
+    int len = 1;
+    for (size_t i = 1; i < flags.size(); ++i) {
+        if (flags[i] == flags[i - 1]) {
+            len++;
+            continue;
+        }
+        allRuns.push_back(len);
+        if (cur != 0) {
+            maskedRuns.push_back(len);
+            stats.maxMaskedRunLength = std::max(stats.maxMaskedRunLength, len);
+        } else {
+            rawRuns.push_back(len);
+            stats.maxRawRunLength = std::max(stats.maxRawRunLength, len);
+        }
+        stats.switchCount++;
+        cur = flags[i];
+        len = 1;
+    }
+    allRuns.push_back(len);
+    if (cur != 0) {
+        maskedRuns.push_back(len);
+        stats.maxMaskedRunLength = std::max(stats.maxMaskedRunLength, len);
+    } else {
+        rawRuns.push_back(len);
+        stats.maxRawRunLength = std::max(stats.maxRawRunLength, len);
+    }
+    auto mean_of = [](const std::vector<int> &vals) -> double {
+        if (vals.empty()) return 0.0;
+        double sum = 0.0;
+        for (int v : vals) sum += (double)v;
+        return sum / (double)vals.size();
+    };
+    stats.meanRunLength = mean_of(allRuns);
+    stats.meanMaskedRunLength = mean_of(maskedRuns);
+    stats.meanRawRunLength = mean_of(rawRuns);
+    if (flags.size() > 1) {
+        stats.fractionModeSwitches = (double)stats.switchCount / (double)(flags.size() - 1);
+    }
+    return stats;
+}
 
 // -----------------------------------------------------------------------------
 // Multi-template matching \"detector\" for pixel-style games (pixelMode)
@@ -167,6 +259,11 @@ static bool load_pixel_templates_once(const OfflineOptions &opt) {
         files.push_back(p);
     }
     std::sort(files.begin(), files.end());
+    if (opt.pixelMaxTemplates > 0 && static_cast<int>(files.size()) > opt.pixelMaxTemplates) {
+        std::cout << "[PixelTemplates] Limiting template load from " << files.size()
+                  << " to " << opt.pixelMaxTemplates << " files for memory control." << std::endl;
+        files.resize(static_cast<size_t>(opt.pixelMaxTemplates));
+    }
 
     // Discover kinds from subfolders (first path component of relative path)
     std::set<std::string> kindSet;
@@ -299,6 +396,64 @@ static std::string find_best_phash_match(const std::unordered_map<std::string, D
     return bestHash;
 }
 
+static std::string resolve_yolo_matcher(const OfflineOptions &opt) {
+    if (!opt.yoloMatcher.empty()) return opt.yoloMatcher;
+    return opt.yoloLatentKey ? "latent_key" : "phash";
+}
+
+static cv::Mat compute_rgb_hist_feature(const cv::Mat &bgr, const cv::Mat &mask_u8) {
+    if (bgr.empty()) return cv::Mat();
+    cv::Mat hist;
+    int channels[] = {0, 1, 2};
+    int hist_size[] = {8, 8, 8};
+    float range[] = {0.0f, 256.0f};
+    const float *ranges[] = {range, range, range};
+    cv::calcHist(&bgr, 1, channels, mask_u8, hist, 3, hist_size, ranges, true, false);
+    if (!hist.empty()) {
+        cv::normalize(hist, hist, 1.0, 0.0, cv::NORM_L1);
+    }
+    return hist;
+}
+
+static std::string find_best_rgb_hist_match(const std::unordered_map<std::string, DictItem> &dict,
+                                            const cv::Mat &roi_bgr,
+                                            const cv::Mat &roi_mask_u8,
+                                            int cls,
+                                            const cv::Size &wh,
+                                            std::unordered_map<std::string, cv::Mat> &hist_cache,
+                                            double min_score = 0.70) {
+    cv::Mat query_hist = compute_rgb_hist_feature(roi_bgr, roi_mask_u8);
+    if (query_hist.empty()) return {};
+    double best_score = min_score;
+    std::string best_hash;
+    for (const auto &kv : dict) {
+        const DictItem &it = kv.second;
+        if (it.cls != cls) continue;
+        if (std::abs(it.width - wh.width) > 2 || std::abs(it.height - wh.height) > 2) continue;
+        cv::Mat cand_hist;
+        auto hit = hist_cache.find(it.hash);
+        if (hit != hist_cache.end()) {
+            cand_hist = hit->second;
+        } else {
+            cv::Mat tpl = cv::imread(it.path, cv::IMREAD_UNCHANGED);
+            if (tpl.empty()) continue;
+            cv::Mat tpl_bgr;
+            cv::cvtColor(tpl, tpl_bgr, cv::COLOR_BGRA2BGR);
+            cv::Mat tpl_mask;
+            cv::extractChannel(tpl, tpl_mask, 3);
+            cand_hist = compute_rgb_hist_feature(tpl_bgr, tpl_mask);
+            if (cand_hist.empty()) continue;
+            hist_cache.emplace(it.hash, cand_hist);
+        }
+        double score = cv::compareHist(query_hist, cand_hist, cv::HISTCMP_CORREL);
+        if (score > best_score) {
+            best_score = score;
+            best_hash = it.hash;
+        }
+    }
+    return best_hash;
+}
+
 static float iou_rect(const cv::Rect &a, const cv::Rect &b) {
     int x1 = std::max(a.x, b.x);
     int y1 = std::max(a.y, b.y);
@@ -357,7 +512,7 @@ static float pixel_template_accept_thr(int ti, const OfflineOptions &opt) {
 
 // Calibrate best scale per template using the first frame's edges.
 // We test multiple candidate scales and keep the one with the highest max NCC score.
-static void calibrate_template_scales(const cv::Mat &frame_edges) {
+static void calibrate_template_scales(const cv::Mat &frame_edges, const OfflineOptions &opt) {
     if (g_pixel_scales_calibrated) return;
     if (g_pixel_templates.empty()) return;
 
@@ -378,25 +533,45 @@ static void calibrate_template_scales(const cv::Mat &frame_edges) {
         double best_scale = 1.0;
         double best_score = -1.0;
 
-        for (double s : candidate_scales) {
+        // Force fixed scale if requested (prevents half-size boxes due to noisy auto-calibration).
+        if (opt.pixelForceScale > 0.0f) {
+            double s = (double)opt.pixelForceScale;
             int th = static_cast<int>(tmpl.edges.rows * s);
             int tw = static_cast<int>(tmpl.edges.cols * s);
-            if (th < 8 || tw < 8) continue;
-            if (th >= frame_edges.rows || tw >= frame_edges.cols) continue;
+            if (th >= 8 && tw >= 8 && th < frame_edges.rows && tw < frame_edges.cols) {
+                cv::Mat tmpl_rs;
+                cv::resize(tmpl.edges, tmpl_rs, cv::Size(tw, th), 0, 0, cv::INTER_AREA);
+                cv::Mat res;
+                cv::matchTemplate(frame_edges, tmpl_rs, res, cv::TM_CCOEFF_NORMED);
+                if (!res.empty()) {
+                    double minVal, maxVal;
+                    cv::minMaxLoc(res, &minVal, &maxVal, nullptr, nullptr);
+                    best_score = maxVal;
+                    best_scale = s;
+                }
+            }
+        } else {
 
-            cv::Mat tmpl_rs;
-            cv::resize(tmpl.edges, tmpl_rs, cv::Size(tw, th),
-                       0, 0, cv::INTER_AREA);
+            for (double s : candidate_scales) {
+                int th = static_cast<int>(tmpl.edges.rows * s);
+                int tw = static_cast<int>(tmpl.edges.cols * s);
+                if (th < 8 || tw < 8) continue;
+                if (th >= frame_edges.rows || tw >= frame_edges.cols) continue;
 
-            cv::Mat res;
-            cv::matchTemplate(frame_edges, tmpl_rs, res, cv::TM_CCOEFF_NORMED);
-            if (res.empty()) continue;
+                cv::Mat tmpl_rs;
+                cv::resize(tmpl.edges, tmpl_rs, cv::Size(tw, th),
+                           0, 0, cv::INTER_AREA);
 
-            double minVal, maxVal;
-            cv::minMaxLoc(res, &minVal, &maxVal, nullptr, nullptr);
-            if (maxVal > best_score) {
-                best_score = maxVal;
-                best_scale = s;
+                cv::Mat res;
+                cv::matchTemplate(frame_edges, tmpl_rs, res, cv::TM_CCOEFF_NORMED);
+                if (res.empty()) continue;
+
+                double minVal, maxVal;
+                cv::minMaxLoc(res, &minVal, &maxVal, nullptr, nullptr);
+                if (maxVal > best_score) {
+                    best_score = maxVal;
+                    best_scale = s;
+                }
             }
         }
 
@@ -424,7 +599,7 @@ static void template_match_detections(const cv::Mat &frame_bgr,
 
     // On first frame, calibrate per-template best scale using finer-grained candidates.
     if (!g_pixel_scales_calibrated) {
-        calibrate_template_scales(frame_edges);
+        calibrate_template_scales(frame_edges, opt);
     }
     const float nms_iou = 0.3f;        // IOU for NMS
     const double zscore = 2.5;         // Threshold: mean + zscore * std
@@ -523,6 +698,12 @@ struct PixelTracker {
     cv::KalmanFilter kf;
     cv::Mat prev_gray;
 
+    // Persisted multi-peak detections between re-bootstrap intervals to avoid
+    // frame-to-frame region flicker (which breaks block/motion prediction).
+    std::vector<cv::Rect> persisted_peaks;
+    std::vector<int> persisted_peak_ti;
+    int persisted_peaks_frame{-999999};
+
     static float color_score_mean_bgr(const cv::Mat &tpl_bgr, const cv::Mat &roi_bgr) {
         if (tpl_bgr.empty() || roi_bgr.empty()) return 0.0f;
         cv::Scalar mt = cv::mean(tpl_bgr);
@@ -574,11 +755,63 @@ struct PixelTracker {
         row_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     }
 
-    // Sparse optical flow: estimate global vertical shift (dy) between prev_gray and cur_gray.
-    static bool estimate_flow_dy(const cv::Mat &prev_gray, const cv::Mat &cur_gray,
-                                int maxPts, float &outDy, double &flow_ms) {
+    // Windowed band selection: restrict band candidates around a predicted center Y.
+    // This avoids picking unrelated strong edges (HUD/text) and keeps masking focused
+    // on the tracked sprite/tile rows, improving stability and coverage across the frame.
+    static void select_bands_from_edges_window(const cv::Mat &edges,
+                                               int centerY, int halfWindow,
+                                               int numBands, int minSep,
+                                               std::vector<int> &outY, double &row_ms) {
+        auto t0 = std::chrono::steady_clock::now();
+        outY.clear();
+        if (edges.empty()) { row_ms = 0.0; return; }
+        numBands = std::max(1, numBands);
+        minSep = std::max(1, minSep);
+        halfWindow = std::max(1, halfWindow);
+        centerY = std::max(0, std::min(edges.rows - 1, centerY));
+        int y0 = std::max(0, centerY - halfWindow);
+        int y1 = std::min(edges.rows, centerY + halfWindow + 1);
+        if (y1 <= y0 + 1) {
+            outY.push_back(centerY);
+            row_ms = 0.0;
+            return;
+        }
+
+        // Row energy in window
+        std::vector<float> energy((size_t)(y1 - y0), 0.0f);
+        for (int y = y0; y < y1; ++y) {
+            const uchar *p = edges.ptr<uchar>(y);
+            int cnt = 0;
+            for (int x = 0; x < edges.cols; ++x) cnt += (p[x] != 0);
+            energy[(size_t)(y - y0)] = (float)cnt / (float)std::max(1, edges.cols);
+        }
+
+        // Peak picking in window, then add y0 offset
+        std::vector<float> work = energy;
+        for (int i = 0; i < numBands; ++i) {
+            int bestJ = -1;
+            float bestV = 0.0f;
+            for (int j = 0; j < (int)work.size(); ++j) {
+                if (work[j] > bestV) { bestV = work[j]; bestJ = j; }
+            }
+            if (bestJ < 0 || bestV <= 1e-6f) break;
+            outY.push_back(y0 + bestJ);
+            int j0 = std::max(0, bestJ - minSep);
+            int j1 = std::min((int)work.size(), bestJ + minSep + 1);
+            for (int j = j0; j < j1; ++j) work[j] = 0.0f;
+        }
+
+        auto t1 = std::chrono::steady_clock::now();
+        row_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    }
+
+    // Sparse optical flow: estimate global shift (dx,dy) between prev_gray and cur_gray.
+    // We use the median LK displacement to be robust to outliers.
+    static bool estimate_flow_dxdy(const cv::Mat &prev_gray, const cv::Mat &cur_gray,
+                                int maxPts, float &outDx, float &outDy, double &flow_ms) {
         auto t0 = std::chrono::steady_clock::now();
         outDy = 0.0f;
+        outDx = 0.0f;
         if (prev_gray.empty() || cur_gray.empty()) { flow_ms = 0.0; return false; }
         std::vector<cv::Point2f> p0;
         cv::goodFeaturesToTrack(prev_gray, p0, std::max(10, maxPts), 0.01, 8);
@@ -588,14 +821,20 @@ struct PixelTracker {
         std::vector<float> err;
         cv::calcOpticalFlowPyrLK(prev_gray, cur_gray, p0, p1, status, err,
                                  cv::Size(21, 21), 3);
+        std::vector<float> dxs;
         std::vector<float> dys;
+        dxs.reserve(p0.size());
         dys.reserve(p0.size());
         for (size_t i = 0; i < p0.size(); ++i) {
             if (!status[i]) continue;
+            dxs.push_back(p1[i].x - p0[i].x);
             dys.push_back(p1[i].y - p0[i].y);
         }
         if (dys.size() < 8) { flow_ms = 0.0; return false; }
+        if (dxs.size() < 8) { flow_ms = 0.0; return false; }
         std::nth_element(dys.begin(), dys.begin() + dys.size() / 2, dys.end());
+        std::nth_element(dxs.begin(), dxs.begin() + dxs.size() / 2, dxs.end());
+        outDx = dxs[dxs.size() / 2];
         outDy = dys[dys.size() / 2];
         auto t1 = std::chrono::steady_clock::now();
         flow_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -704,8 +943,9 @@ struct PixelTracker {
     bool roi_match(const cv::Mat &frame_bgr, const cv::Mat &frame_edges, int frameIdx, const OfflineOptions &opt,
                    cv::Rect &outBox, float &outScore, int &outTemplateIdx,
                    std::vector<std::pair<int, float>> &outRanked, // (ti, score) sorted desc
-                   double &roi_ms, int &scanned) {
+                   double &roi_ms, double &kalman_ms, int &scanned) {
         auto t0 = std::chrono::steady_clock::now();
+        kalman_ms = 0.0;
         scanned = 0;
 
         if (!inited || lastBox.area() <= 0) {
@@ -714,9 +954,16 @@ struct PixelTracker {
             return false;
         }
 
-        cv::Mat pred = kf.predict();
-        float pcx = pred.at<float>(0);
-        float pcy = pred.at<float>(1);
+        float pcx = lastBox.x + lastBox.width * 0.5f;
+        float pcy = lastBox.y + lastBox.height * 0.5f;
+        if (opt.pixelUseKalman) {
+            auto t_k0 = std::chrono::steady_clock::now();
+            cv::Mat pred = kf.predict();
+            pcx = pred.at<float>(0);
+            pcy = pred.at<float>(1);
+            auto t_k1 = std::chrono::steady_clock::now();
+            kalman_ms += std::chrono::duration<double, std::milli>(t_k1 - t_k0).count();
+        }
         int pad = std::max(0, opt.pixelRoiPad);
         cv::Rect roi((int)(pcx - lastBox.width * 0.5f) - pad,
                      (int)(pcy - lastBox.height * 0.5f) - pad,
@@ -790,11 +1037,15 @@ struct PixelTracker {
         b = clamp_rect(b, frame_edges.size());
         outBox = b;
 
-        // Kalman update
-        cv::Mat meas(2, 1, CV_32F);
-        meas.at<float>(0) = b.x + b.width * 0.5f;
-        meas.at<float>(1) = b.y + b.height * 0.5f;
-        kf.correct(meas);
+        if (opt.pixelUseKalman) {
+            auto t_k2 = std::chrono::steady_clock::now();
+            cv::Mat meas(2, 1, CV_32F);
+            meas.at<float>(0) = b.x + b.width * 0.5f;
+            meas.at<float>(1) = b.y + b.height * 0.5f;
+            kf.correct(meas);
+            auto t_k3 = std::chrono::steady_clock::now();
+            kalman_ms += std::chrono::duration<double, std::milli>(t_k3 - t_k2).count();
+        }
 
         lastBox = b;
         lastScore = best.score;
@@ -841,6 +1092,15 @@ struct PixelTracker {
         int padY = std::max(0, opt.pixelBandPadY);
         int maxPeaks = std::max(1, opt.pixelMaxPeaks);
         int nms = std::max(1, opt.pixelPeakNms);
+        // For repetitive tiles, suppressing only a few pixels around the peak causes many overlapping
+        // detections to cluster (e.g., left side), exhausting maxPeaks and leaving other areas (e.g., right side)
+        // unmasked. Ensure the suppression window is at least proportional to the template size so picked peaks
+        // correspond to mostly non-overlapping boxes.
+        // Use a suppression window close to the template size to strongly discourage overlaps.
+        // This helps ensure we cover the whole row (including right side) instead of repeatedly
+        // selecting adjacent maxima around the same few tiles.
+        int nms_x = std::max(nms, std::max(2, (int)std::round((double)tw * 0.8)));
+        int nms_y = std::max(nms, std::max(2, (int)std::round((double)th * 0.8)));
         float thr = pixel_template_accept_thr(ti, opt);
 
         cv::Mat tmpl_rs;
@@ -882,10 +1142,10 @@ struct PixelTracker {
                     if (final >= thr) out.push_back({patch, final});
                 }
 
-                int sx0 = std::max(0, maxP.x - nms);
-                int sy0 = std::max(0, maxP.y - nms);
-                int sx1 = std::min(work.cols, maxP.x + nms + 1);
-                int sy1 = std::min(work.rows, maxP.y + nms + 1);
+                int sx0 = std::max(0, maxP.x - nms_x);
+                int sy0 = std::max(0, maxP.y - nms_y);
+                int sx1 = std::min(work.cols, maxP.x + nms_x + 1);
+                int sy1 = std::min(work.rows, maxP.y + nms_y + 1);
                 work(cv::Rect(sx0, sy0, sx1 - sx0, sy1 - sy0)).setTo(0.0f);
             }
         }
@@ -1131,16 +1391,30 @@ void OfflineProcessor::paint_mask_color(cv::Mat &dst_bgr, const cv::Mat &mask, c
     left = std::max(0, left);
     top = std::max(0, top);
     
+    // Clamp alpha for safety.
+    if (alpha < 0.0f) alpha = 0.0f;
+    if (alpha > 1.0f) alpha = 1.0f;
+    const bool solid = (alpha >= 0.999f);
+
     for (int y = top; y < bottom; ++y) {
         const uchar *mrow = mask.ptr<uchar>(y);
         cv::Vec3b *drow = dst_bgr.ptr<cv::Vec3b>(y);
         for (int x = left; x < right; ++x) {
             if (mrow[x] == 0) continue;
-            // Solid fill: overwrite pixel with constant color (no blending)
             cv::Vec3b &dpx = drow[x];
-            dpx[0] = color[0];
-            dpx[1] = color[1];
-            dpx[2] = color[2];
+            if (solid) {
+                // Solid fill: overwrite pixel with constant color
+                dpx[0] = color[0];
+                dpx[1] = color[1];
+                dpx[2] = color[2];
+            } else {
+                // Alpha blend: d = (1-a)*d + a*c
+                for (int k = 0; k < 3; ++k) {
+                    float v = (1.0f - alpha) * (float)dpx[k] + alpha * (float)color[k];
+                    int iv = (int)std::lround(v);
+                    dpx[k] = (uchar)std::max(0, std::min(255, iv));
+                }
+            }
         }
     }
 }
@@ -1351,6 +1625,124 @@ static bool best_alpha_mask_offset(
     return best_extra_ratio_out < 1e9;
 }
 
+static uint64_t count_alpha_nonzero_in_safe(const cv::Mat &rgba, const cv::Rect &bbox, const cv::Rect &safe) {
+    if (rgba.empty() || rgba.type() != CV_8UC4) return 0;
+    if (safe.area() <= 0) return 0;
+    int ax0 = safe.x - bbox.x;
+    int ay0 = safe.y - bbox.y;
+    if (ax0 < 0 || ay0 < 0) return 0;
+    if (ax0 + safe.width > rgba.cols) return 0;
+    if (ay0 + safe.height > rgba.rows) return 0;
+    cv::Mat a;
+    cv::extractChannel(rgba, a, 3);
+    cv::Mat aroi = a(cv::Rect(ax0, ay0, safe.width, safe.height));
+    return (uint64_t)cv::countNonZero(aroi);
+}
+
+// Find a small integer offset (dx,dy) that best aligns template RGB (under alpha) to the current frame ROI.
+// This is more robust than relying on segmentation mask geometry when the mask jitters or is imperfect.
+static bool best_alpha_rgb_offset_mse(
+    const cv::Mat &tpl_rgba_resized,
+    const cv::Mat &frame_bgr,
+    const cv::Rect &bbox,
+    int max_shift,
+    int &best_dx,
+    int &best_dy,
+    double &best_mse_out
+) {
+    best_dx = 0; best_dy = 0; best_mse_out = 1e18;
+    if (tpl_rgba_resized.empty() || frame_bgr.empty()) return false;
+    if (tpl_rgba_resized.type() != CV_8UC4) return false;
+    if (frame_bgr.type() != CV_8UC3) return false;
+    if (tpl_rgba_resized.cols != bbox.width || tpl_rgba_resized.rows != bbox.height) return false;
+    cv::Rect safe = bbox & cv::Rect(0, 0, frame_bgr.cols, frame_bgr.rows);
+    if (safe.area() <= 0) return false;
+
+    // Evaluate shifts: minimize masked RGB MSE under template alpha.
+    //
+    // Performance notes:
+    // - For large bboxes (e.g., racing HUD regions), an exhaustive search is extremely expensive.
+    // - We down-sample by striding, and also cap the shift search for large regions.
+    const int64_t area = (int64_t)safe.width * (int64_t)safe.height;
+    int stride = 4;
+    if (area > 600000) stride = 16;
+    else if (area > 250000) stride = 8;
+    // Cap shift search aggressively for large regions.
+    int shift_cap = max_shift;
+    if (area > 250000) shift_cap = std::min(shift_cap, 2);
+    else shift_cap = std::min(shift_cap, 4);
+
+    for (int dy = -shift_cap; dy <= shift_cap; ++dy) {
+        for (int dx = -shift_cap; dx <= shift_cap; ++dx) {
+            double sse = 0.0;
+            uint64_t cnt = 0;
+
+            for (int y = 0; y < safe.height; ++y) {
+                if ((y % stride) != 0) continue;
+                int fy = safe.y + y;
+                int ty = (fy - bbox.y) - dy;
+                if (ty < 0 || ty >= tpl_rgba_resized.rows) continue;
+                const cv::Vec3b *frow = frame_bgr.ptr<cv::Vec3b>(fy);
+                const cv::Vec4b *trow = tpl_rgba_resized.ptr<cv::Vec4b>(ty);
+                for (int x = 0; x < safe.width; ++x) {
+                    if ((x % stride) != 0) continue;
+                    int fx = safe.x + x;
+                    int tx = (fx - bbox.x) - dx;
+                    if (tx < 0 || tx >= tpl_rgba_resized.cols) continue;
+                    const cv::Vec4b &tp = trow[tx];
+                    if (tp[3] == 0) continue;
+                    const cv::Vec3b &fp = frow[fx];
+                    for (int c = 0; c < 3; ++c) {
+                        double d = (double)tp[c] - (double)fp[c];
+                        sse += d * d;
+                    }
+                    cnt++;
+                }
+            }
+            if (cnt < 32) continue; // too few sampled alpha pixels, reject
+            double mse = sse / (double)(cnt * 3);
+            if (mse < best_mse_out) {
+                best_mse_out = mse;
+                best_dx = dx;
+                best_dy = dy;
+            }
+        }
+    }
+    return best_mse_out < 1e18;
+}
+
+static double template_alpha_mask_coverage(
+    const cv::Mat &tpl_rgba_resized,
+    const cv::Mat &full_mask_u8,
+    const cv::Rect &bbox,
+    int dx,
+    int dy
+) {
+    if (tpl_rgba_resized.empty() || full_mask_u8.empty()) return 0.0;
+    if (tpl_rgba_resized.type() != CV_8UC4) return 0.0;
+    cv::Rect safe = bbox & cv::Rect(0, 0, full_mask_u8.cols, full_mask_u8.rows);
+    if (safe.area() <= 0) return 0.0;
+    uint64_t alpha_cnt = 0;
+    uint64_t inter = 0;
+    for (int y = 0; y < safe.height; ++y) {
+        int my = safe.y + y;
+        int ty = (my - bbox.y) - dy;
+        if (ty < 0 || ty >= tpl_rgba_resized.rows) continue;
+        const uchar *mrow = full_mask_u8.ptr<uchar>(my);
+        const cv::Vec4b *trow = tpl_rgba_resized.ptr<cv::Vec4b>(ty);
+        for (int x = 0; x < safe.width; ++x) {
+            int mx = safe.x + x;
+            int tx = (mx - bbox.x) - dx;
+            if (tx < 0 || tx >= tpl_rgba_resized.cols) continue;
+            if (trow[tx][3] == 0) continue;
+            alpha_cnt++;
+            if (mrow[mx] != 0) inter++;
+        }
+    }
+    if (alpha_cnt == 0) return 0.0;
+    return (double)inter / (double)alpha_cnt;
+}
+
 // --- Quality metrics (PSNR / SSIM) -----------------------------------------
 
 // Compute PSNR between two images
@@ -1414,7 +1806,215 @@ static double computeSSIM(const cv::Mat &i1, const cv::Mat &i2) {
     return (mssim[0] + mssim[1] + mssim[2]) / 3.0;
 }
 
+static cv::Vec3b choose_mask_color_bgr(const OfflineOptions &opt, int classId, const cv::Vec3b &dominant_bgr) {
+    if (opt.maskColor == "dominant") return dominant_bgr;
+    if (opt.maskColor == "black") return cv::Vec3b(0, 0, 0);
+    if (opt.maskColor == "brown") return cv::Vec3b(42, 42, 165); // BGR for RGB(165,42,42)
+    if (opt.maskColor == "rgb") return cv::Vec3b((uchar)opt.maskColorB, (uchar)opt.maskColorG, (uchar)opt.maskColorR);
+    if (opt.maskColor == "class") return yolo_class_color(classId);
+    if (opt.yoloClassConsistentColor) return yolo_class_color(classId);
+    return cv::Vec3b(0, 255, 0);
+}
+
+static cv::Vec3b dominant_color_bgr_hist(const cv::Mat &frame_bgr) {
+    if (frame_bgr.empty() || frame_bgr.type() != CV_8UC3) return cv::Vec3b(0, 0, 0);
+    // Downsample for speed.
+    cv::Mat small;
+    const int target_w = 160;
+    int w = frame_bgr.cols;
+    int h = frame_bgr.rows;
+    if (w <= 0 || h <= 0) return cv::Vec3b(0, 0, 0);
+    int tw = std::min(target_w, w);
+    int th = std::max(1, (int)((double)h * (double)tw / (double)std::max(1, w)));
+    cv::resize(frame_bgr, small, cv::Size(tw, th), 0, 0, cv::INTER_AREA);
+
+    // 4 bits per channel => 16^3 bins = 4096.
+    std::array<uint32_t, 4096> hist{};
+    hist.fill(0);
+    for (int y = 0; y < small.rows; ++y) {
+        const cv::Vec3b *row = small.ptr<cv::Vec3b>(y);
+        for (int x = 0; x < small.cols; ++x) {
+            cv::Vec3b p = row[x];
+            int b = p[0] >> 4;
+            int g = p[1] >> 4;
+            int r = p[2] >> 4;
+            int idx = (r << 8) | (g << 4) | b;
+            hist[(size_t)idx] += 1;
+        }
+    }
+    uint32_t best = 0;
+    int best_idx = 0;
+    for (int i = 0; i < 4096; ++i) {
+        if (hist[(size_t)i] > best) { best = hist[(size_t)i]; best_idx = i; }
+    }
+    int b4 = best_idx & 0xF;
+    int g4 = (best_idx >> 4) & 0xF;
+    int r4 = (best_idx >> 8) & 0xF;
+    // Bin center in 8-bit space.
+    int b8 = b4 * 16 + 8;
+    int g8 = g4 * 16 + 8;
+    int r8 = r4 * 16 + 8;
+    return cv::Vec3b((uchar)b8, (uchar)g8, (uchar)r8);
+}
+
+// -----------------------------------------------------------------------------
+// Fill + feather compositing helpers (reduce sharp edges from solid paint)
+// -----------------------------------------------------------------------------
+static inline int clampi(int v, int lo, int hi) { return std::max(lo, std::min(hi, v)); }
+
+// Replace pixels under mask within bbox using fill frame, with optional feathering back to original at boundary.
+// - mask_full_u8: full-frame CV_8UC1 (0/255 or alpha mask), non-zero means "inside region".
+// - fill_bgr: full-frame CV_8UC3 to sample fill pixels from (same size as orig).
+static void apply_fill_with_feather_bbox(
+    cv::Mat &dst_bgr,
+    const cv::Mat &orig_bgr,
+    const cv::Mat &fill_bgr,
+    const cv::Mat &mask_full_u8,
+    const cv::Rect &bbox,
+    int feather_px
+) {
+    if (dst_bgr.empty() || orig_bgr.empty() || fill_bgr.empty() || mask_full_u8.empty()) return;
+    if (dst_bgr.type() != CV_8UC3 || orig_bgr.type() != CV_8UC3 || fill_bgr.type() != CV_8UC3) return;
+    if (mask_full_u8.type() != CV_8UC1) return;
+    if (dst_bgr.size() != orig_bgr.size() || dst_bgr.size() != fill_bgr.size() || dst_bgr.size() != mask_full_u8.size()) return;
+
+    cv::Rect safe = bbox & cv::Rect(0, 0, dst_bgr.cols, dst_bgr.rows);
+    if (safe.area() <= 0) return;
+
+    cv::Mat mroi = mask_full_u8(safe);
+    if (cv::countNonZero(mroi) == 0) return;
+
+    // No feather: direct copy from fill for masked pixels.
+    if (feather_px <= 0) {
+        for (int y = safe.y; y < safe.y + safe.height; ++y) {
+            const uchar *mrow = mask_full_u8.ptr<uchar>(y);
+            const cv::Vec3b *frow = fill_bgr.ptr<cv::Vec3b>(y);
+            cv::Vec3b *drow = dst_bgr.ptr<cv::Vec3b>(y);
+            for (int x = safe.x; x < safe.x + safe.width; ++x) {
+                if (mrow[x] == 0) continue;
+                drow[x] = frow[x];
+            }
+        }
+        return;
+    }
+
+    // Feather: blend fill->original across a boundary band inside the mask.
+    // DistanceTransform expects non-zero = foreground; it returns distance to nearest zero (background).
+    cv::Mat bin;
+    cv::threshold(mroi, bin, 0, 255, cv::THRESH_BINARY);
+    cv::Mat dist;
+    cv::distanceTransform(bin, dist, cv::DIST_L2, 3);
+
+    const float inv = 1.0f / (float)std::max(1, feather_px);
+    for (int yy = 0; yy < safe.height; ++yy) {
+        int y = safe.y + yy;
+        const uchar *mrow = mask_full_u8.ptr<uchar>(y);
+        const cv::Vec3b *orow = orig_bgr.ptr<cv::Vec3b>(y);
+        const cv::Vec3b *frow = fill_bgr.ptr<cv::Vec3b>(y);
+        cv::Vec3b *drow = dst_bgr.ptr<cv::Vec3b>(y);
+        const float *drowf = dist.ptr<float>(yy);
+        for (int xx = 0; xx < safe.width; ++xx) {
+            int x = safe.x + xx;
+            if (mrow[x] == 0) continue;
+            float w = drowf[xx] * inv;
+            if (w <= 0.0f) {
+                drow[x] = orow[x];
+            } else if (w >= 1.0f) {
+                drow[x] = frow[x];
+            } else {
+                cv::Vec3b o = orow[x];
+                cv::Vec3b f = frow[x];
+                cv::Vec3b out;
+                for (int c = 0; c < 3; ++c) {
+                    float v = (1.0f - w) * (float)o[c] + w * (float)f[c];
+                    out[c] = (uchar)clampi((int)std::lround(v), 0, 255);
+                }
+                drow[x] = out;
+            }
+        }
+    }
+}
+
+// Create a fill frame based on mode (blur/bg_ema/inpaint/solid-as-image).
+// bg_ema is stateful across frames; we keep it as CV_32FC3 in BGR.
+static cv::Mat make_fill_frame_bgr(
+    const cv::Mat &orig_bgr,
+    const cv::Mat &mask_union_u8,
+    const OfflineOptions &opt,
+    const cv::Vec3b &dominant_bgr,
+    cv::Mat &bg_ema_f32,
+    bool &bg_inited
+) {
+    if (orig_bgr.empty() || orig_bgr.type() != CV_8UC3) return cv::Mat();
+    cv::Mat fill = orig_bgr.clone();
+
+    std::string mode = opt.fillMode;
+    for (auto &ch : mode) ch = (char)std::tolower((unsigned char)ch);
+
+    if (mode == "blur") {
+        float sigma = std::max(0.0f, opt.fillBlurSigma);
+        if (sigma <= 1e-6f) return fill;
+        int k = (int)(2 * std::lround(3.0 * sigma) + 1);
+        k = std::max(3, k);
+        if ((k % 2) == 0) k += 1;
+        cv::GaussianBlur(orig_bgr, fill, cv::Size(k, k), sigma, sigma, cv::BORDER_DEFAULT);
+        return fill;
+    }
+
+    if (mode == "bg_ema") {
+        float a = opt.fillBgEmaAlpha;
+        if (a < 0.0f) a = 0.0f;
+        if (a > 0.9999f) a = 0.9999f;
+        if (!bg_inited || bg_ema_f32.empty() || bg_ema_f32.size() != orig_bgr.size()) {
+            orig_bgr.convertTo(bg_ema_f32, CV_32FC3);
+            bg_inited = true;
+        } else {
+            // Update EMA only on unmasked pixels (mask=0)
+            cv::Mat cur_f32;
+            orig_bgr.convertTo(cur_f32, CV_32FC3);
+            for (int y = 0; y < orig_bgr.rows; ++y) {
+                const uchar *mrow = mask_union_u8.empty() ? nullptr : mask_union_u8.ptr<uchar>(y);
+                const cv::Vec3f *crow = cur_f32.ptr<cv::Vec3f>(y);
+                cv::Vec3f *brow = bg_ema_f32.ptr<cv::Vec3f>(y);
+                for (int x = 0; x < orig_bgr.cols; ++x) {
+                    bool masked = (mrow && mrow[x] != 0);
+                    if (masked) continue;
+                    brow[x] = a * brow[x] + (1.0f - a) * crow[x];
+                }
+            }
+        }
+        bg_ema_f32.convertTo(fill, CV_8UC3);
+        return fill;
+    }
+
+    if (mode == "inpaint") {
+        if (mask_union_u8.empty() || cv::countNonZero(mask_union_u8) == 0) return fill;
+        int radius = std::max(1, opt.fillInpaintRadius);
+        int method = cv::INPAINT_TELEA;
+        std::string m = opt.fillInpaintMethod;
+        for (auto &ch : m) ch = (char)std::tolower((unsigned char)ch);
+        if (m == "ns" || m == "navier" || m == "navier-stokes") method = cv::INPAINT_NS;
+        cv::inpaint(orig_bgr, mask_union_u8, fill, (double)radius, method);
+        return fill;
+    }
+
+    // solid (as an image): build constant-color fill frame so the same compositing path can be used.
+    if (mode == "solid" || mode.empty()) {
+        cv::Vec3b c = choose_mask_color_bgr(opt, /*classId=*/0, dominant_bgr);
+        fill.setTo(cv::Scalar(c[0], c[1], c[2]));
+        return fill;
+    }
+
+    // Unknown mode: fallback to solid green
+    fill.setTo(cv::Scalar(0, 255, 0));
+    return fill;
+}
+
 int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
+    // Avoid hard-crash (exit code 141) if ffmpeg terminates early and our stdin pipe breaks.
+    // We'll detect broken pipes via fwrite return values instead.
+    std::signal(SIGPIPE, SIG_IGN);
+    const std::string yolo_matcher = resolve_yolo_matcher(opt);
     fs::create_directories(opt.outDir);
     if (!opt.pixelMode) {
         fs::create_directories(opt.dictDir);
@@ -1424,7 +2024,7 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
     OfflineProcessor processor(opt.outDir, opt.pixelMode ? "" : opt.dictDir);
     
     // Load existing dictionary only for traditional (YOLO) mode
-    if (!opt.pixelMode && !opt.yoloLatentKey) {
+    if (!opt.pixelMode && yolo_matcher != "latent_key") {
         if (processor.loadDictionary()) {
             std::cout << "Loaded existing dictionary with " << processor.getDict().size() << " items." << std::endl;
         } else {
@@ -1448,25 +2048,241 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
     std::string originalOut = opt.outDir + "/original_output.mp4"; // Baseline video (no masking)
     std::string reportPath = opt.outDir + "/report.json";
 
-    cv::VideoWriter writer;
-    int fourcc = cv::VideoWriter::fourcc('a','v','c','1'); // H.264 codec
-    writer.open(stitchedOut, fourcc, fps, cv::Size(width, height));
-    if (!writer.isOpened()) {
-        std::cerr << "Warning: could not open stitched output video: " << stitchedOut << std::endl;
-    }
+    // ---------------------------------------------------------------------
+    // Controlled encoder: FFmpeg/libx264 via stdin pipe (BGR rawvideo).
+    // This lets us fix GOP/keyint/scenecut/bframes/preset/profile/crf, unlike OpenCV VideoWriter.
+    // ---------------------------------------------------------------------
+    struct FfmpegPipeWriter {
+        FILE *pipe{nullptr};
+        std::string cmd;
+        std::string stderrLogPath;
+        bool warnedWrite{false};
+        uint64_t bytesWritten{0};
+        int w{0}, h{0};
+        double fps{30.0};
+        bool open(const std::string &outPath, int width, int height, double fpsIn, const OfflineOptions &opt, const char *tag) {
+            w = width; h = height; fps = fpsIn;
+            // Normalize codec name
+            std::string codec = opt.encCodec.empty() ? std::string("libx264") : opt.encCodec;
+            for (auto &ch : codec) ch = (char)std::tolower((unsigned char)ch);
+            const int keyint = std::max(1, opt.encGop);
+            const int bframes = std::max(0, opt.encBFrames);
 
-    cv::VideoWriter origWriter;
-    origWriter.open(originalOut, fourcc, fps, cv::Size(width, height));
-    if (!origWriter.isOpened()) {
-        std::cerr << "Warning: could not open original output video: " << originalOut << std::endl;
-    }
+            // Codec-specific params (x264/x265) and preset mapping (AV1).
+            std::string paramFlag;
+            std::string paramStr;
+            std::string presetArg;
+            std::string extraCodecArgs;
 
-    // Recovered (client-like) video
+            if (codec == "libx264") {
+                std::ostringstream p;
+                p << "keyint=" << keyint
+                  << ":min-keyint=" << keyint
+                  << ":bframes=" << bframes;
+                if (opt.encNoScenecut) p << ":scenecut=0";
+                if (opt.encRepeatHeaders) p << ":repeat-headers=1";
+                if (opt.encAud) p << ":aud=1";
+                paramFlag = "-x264-params";
+                paramStr = p.str();
+                presetArg = opt.encPreset;
+            } else if (codec == "libx265") {
+                std::ostringstream p;
+                p << "keyint=" << keyint
+                  << ":min-keyint=" << keyint
+                  << ":bframes=" << bframes;
+                if (opt.encNoScenecut) p << ":scenecut=0";
+                if (opt.encRepeatHeaders) p << ":repeat-headers=1";
+                if (opt.encAud) p << ":aud=1";
+                paramFlag = "-x265-params";
+                paramStr = p.str();
+                presetArg = opt.encPreset;
+            } else if (codec == "libsvtav1") {
+                // SVT-AV1 uses numeric preset (0=slowest/best, 13=fastest). Map common x264-like presets.
+                auto mapPreset = [&](const std::string &s) -> std::string {
+                    std::string v = s;
+                    for (auto &ch : v) ch = (char)std::tolower((unsigned char)ch);
+                    // If user already passed a number, keep it.
+                    bool allDigits = !v.empty();
+                    for (char c : v) if (c < '0' || c > '9') allDigits = false;
+                    if (allDigits) return v;
+                    if (v == "ultrafast") return "13";
+                    if (v == "superfast") return "12";
+                    if (v == "veryfast") return "11";
+                    if (v == "faster") return "10";
+                    if (v == "fast") return "9";
+                    if (v == "medium") return "8";
+                    if (v == "slow") return "6";
+                    if (v == "slower") return "5";
+                    if (v == "veryslow") return "4";
+                    return "10";
+                };
+                presetArg = mapPreset(opt.encPreset);
+                extraCodecArgs = "-g " + std::to_string(keyint) + " -bf " + std::to_string(bframes) + " -sc_threshold 0";
+            } else if (codec == "libaom-av1") {
+                // libaom-av1 uses -cpu-used (0=best/slow, 8=fast). Map roughly from x264 presets.
+                auto mapCpuUsed = [&](const std::string &s) -> std::string {
+                    std::string v = s;
+                    for (auto &ch : v) ch = (char)std::tolower((unsigned char)ch);
+                    if (v == "veryslow" || v == "slower" || v == "slow") return "2";
+                    if (v == "medium") return "4";
+                    if (v == "fast") return "6";
+                    if (v == "faster" || v == "veryfast" || v == "superfast" || v == "ultrafast") return "8";
+                    return "6";
+                };
+                presetArg.clear(); // not used
+                extraCodecArgs = "-cpu-used " + mapCpuUsed(opt.encPreset) + " -g " + std::to_string(keyint) + " -bf " + std::to_string(bframes) + " -sc_threshold 0";
+            } else {
+                // Unknown codec: try to run it with generic GOP controls (may be ignored by codec).
+                presetArg = opt.encPreset;
+                extraCodecArgs = "-g " + std::to_string(keyint) + " -bf " + std::to_string(bframes) + " -sc_threshold 0";
+            }
+
+            std::ostringstream oss;
+            oss << "ffmpeg -hide_banner -loglevel error -y "
+                << "-f rawvideo -pix_fmt bgr24 "
+                << "-s " << w << "x" << h << " "
+                << "-r " << fps << " "
+                << "-i pipe:0 "
+                << "-an "
+                << "-c:v " << codec << " ";
+
+            if (!presetArg.empty()) {
+                oss << "-preset " << presetArg << " ";
+            }
+            if (!opt.encTune.empty() && opt.encTune != "none") {
+                // Tune is generally x264/x265-only; harmless if unsupported (ffmpeg will error).
+                if (codec == "libx264" || codec == "libx265") {
+                    oss << "-tune " << opt.encTune << " ";
+                }
+            }
+            // Profile/level handling:
+            // - libx264: allow baseline/main/high, etc.
+            // - libx265: ffmpeg/x265 expects main/main10/etc. Passing baseline/high will fail.
+            if (codec == "libx264") {
+                oss << "-profile:v " << opt.encProfile << " "
+                    << "-level:v " << opt.encLevel << " ";
+            }
+            if (!extraCodecArgs.empty()) {
+                oss << extraCodecArgs << " ";
+            }
+            oss << "-pix_fmt yuv420p "
+                ;
+            if (opt.encBitrateMbps > 0.0) {
+                double bitrate = std::max(0.1, opt.encBitrateMbps);
+                double maxrate = (opt.encMaxrateMbps > 0.0) ? opt.encMaxrateMbps : bitrate;
+                double bufsize = (opt.encBufsizeMbits > 0.0) ? opt.encBufsizeMbits : (2.0 * maxrate);
+                oss << "-b:v " << bitrate << "M "
+                    << "-maxrate " << maxrate << "M "
+                    << "-bufsize " << bufsize << "M ";
+            } else {
+                oss << "-crf " << std::max(0, opt.encCrf) << " ";
+            }
+            if (!paramFlag.empty() && !paramStr.empty()) {
+                oss << paramFlag << " \"" << paramStr << "\" ";
+            }
+            oss << "\"" << outPath << "\"";
+            // Capture ffmpeg stderr to a sidecar log for debugging. This prevents silent failures
+            // (e.g., invalid encoder args) from going unnoticed while keeping console output clean.
+            stderrLogPath = outPath + ".ffmpeg.stderr.log";
+            oss << " 2>\"" << stderrLogPath << "\"";
+
+            cmd = oss.str();
+            std::cout << "[FFmpegPipeWriter] start(" << tag << ") cmd: " << cmd << std::endl;
+            pipe = popen(cmd.c_str(), "w");
+            if (!pipe) {
+                std::cerr << "[FFmpegPipeWriter] Failed to start ffmpeg for " << tag << "\n";
+                std::cerr << "  cmd: " << cmd << "\n";
+                std::cerr << "  stderr: " << stderrLogPath << "\n";
+                return false;
+            }
+            return true;
+        }
+        bool write(const cv::Mat &bgr) {
+            if (!pipe) return false;
+            if (bgr.empty()) return false;
+            if (bgr.type() != CV_8UC3) {
+                if (!warnedWrite) {
+                    warnedWrite = true;
+                    std::cerr << "[FFmpegPipeWriter] Unexpected frame type=" << bgr.type()
+                              << " (expected CV_8UC3). stderr: " << stderrLogPath << "\n";
+                    std::cerr << "  cmd: " << cmd << "\n";
+                }
+                return false;
+            }
+            if (bgr.cols != w || bgr.rows != h) {
+                if (!warnedWrite) {
+                    warnedWrite = true;
+                    std::cerr << "[FFmpegPipeWriter] Unexpected frame size=" << bgr.cols << "x" << bgr.rows
+                              << " (expected " << w << "x" << h << "). stderr: " << stderrLogPath << "\n";
+                    std::cerr << "  cmd: " << cmd << "\n";
+                }
+                return false;
+            }
+            size_t need = (size_t)w * (size_t)h * 3;
+            if (!bgr.isContinuous()) {
+                // fallback copy
+                cv::Mat tmp = bgr.clone();
+                size_t wrote = fwrite(tmp.data, 1, need, pipe);
+                if (wrote != need && !warnedWrite) {
+                    warnedWrite = true;
+                    std::cerr << "[FFmpegPipeWriter] Short write to ffmpeg pipe (need=" << need
+                              << " wrote=" << wrote << "). stderr: " << stderrLogPath << "\n";
+                    std::cerr << "  cmd: " << cmd << "\n";
+                }
+                if (wrote == need) bytesWritten += (uint64_t)wrote;
+                return wrote == need;
+            }
+            size_t wrote = fwrite(bgr.data, 1, need, pipe);
+            if (wrote != need && !warnedWrite) {
+                warnedWrite = true;
+                std::cerr << "[FFmpegPipeWriter] Short write to ffmpeg pipe (need=" << need
+                          << " wrote=" << wrote << "). stderr: " << stderrLogPath << "\n";
+                std::cerr << "  cmd: " << cmd << "\n";
+            }
+            if (wrote == need) bytesWritten += (uint64_t)wrote;
+            return wrote == need;
+        }
+        void close() {
+            if (!pipe) return;
+            fflush(pipe);
+            int rc = pclose(pipe);
+            std::cout << "[FFmpegPipeWriter] close bytesWritten=" << bytesWritten
+                      << " stderr: " << stderrLogPath << std::endl;
+            if (rc != 0) {
+                std::cerr << "[FFmpegPipeWriter] ffmpeg non-zero exit (" << rc << "). stderr: " << stderrLogPath << "\n";
+                std::cerr << "  cmd: " << cmd << "\n";
+            }
+            pipe = nullptr;
+        }
+        bool isOpen() const { return pipe != nullptr; }
+    };
+
     std::string recoveredOut = opt.outDir + "/recovered_output.mp4";
-    cv::VideoWriter recWriter;
-    recWriter.open(recoveredOut, fourcc, fps, cv::Size(width, height));
-    if (!recWriter.isOpened()) {
-        std::cerr << "Warning: could not open recovered output video: " << recoveredOut << std::endl;
+    FfmpegPipeWriter writer, origWriter, recWriter;
+    if (!opt.buildIndexOnly) {
+        if (opt.useFfmpegEncoder) {
+            (void)origWriter.open(originalOut, width, height, fps, opt, "baseline");
+            (void)writer.open(stitchedOut, width, height, fps, opt, "masked");
+            (void)recWriter.open(recoveredOut, width, height, fps, opt, "recovered");
+        } else {
+            // Fallback to OpenCV VideoWriter if requested (legacy behavior).
+            cv::VideoWriter vw_mask, vw_base, vw_rec;
+            (void)vw_mask; (void)vw_base; (void)vw_rec;
+            std::cerr << "Warning: --no-ffmpeg-enc selected but OpenCV VideoWriter fallback is not wired in this build.\n";
+        }
+    }
+    std::string frameCacheDir = (fs::path(opt.outDir) / "frame_cache").string();
+    std::string originalFrameCachePath = (fs::path(frameCacheDir) / "original_frames.bgr").string();
+    std::string maskedFrameCachePath = (fs::path(frameCacheDir) / "masked_frames.bgr").string();
+    std::ofstream originalFrameCache;
+    std::ofstream maskedFrameCache;
+    if (opt.dumpFrameCache) {
+        fs::create_directories(frameCacheDir);
+        originalFrameCache.open(originalFrameCachePath, std::ios::binary);
+        maskedFrameCache.open(maskedFrameCachePath, std::ios::binary);
+        if (!originalFrameCache.is_open() || !maskedFrameCache.is_open()) {
+            std::cerr << "Warning: could not open frame cache files under " << frameCacheDir << std::endl;
+        }
     }
 
     uint64_t total_occurrences = 0;
@@ -1502,6 +2318,16 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
     std::vector<json> t_pixel_template_counts; // per-frame: {relPath: count}
     std::vector<int> t_pixel_scanned_bootstrap, t_pixel_scanned_roi, t_pixel_scanned_band;
 
+    // Per-frame CSV fields (always recorded into report.json/per_frame for downstream CSV merge)
+    std::vector<double> t_preprocess_ms, t_inference_ms, t_postprocess_ms;
+    std::vector<double> t_masking_ms, t_encode_baseline_ms, t_encode_masked_ms, t_stitching_ms;
+    std::vector<int> t_object_present_model, t_object_successfully_masked, t_frame_flags; // 0=raw, 1=ref
+    std::vector<int> t_frame_flags_raw;
+    std::vector<int> t_latent_minted_regions, t_latent_reused_regions;
+    std::vector<double> t_masked_bbox_pct, t_masked_alpha_pct;
+    std::vector<int> t_changed_pixels;
+    std::vector<double> t_changed_pixels_pct;
+
     // Optional latent dump (for threshold sweep experiments)
     std::ofstream latOut;
     if (opt.dumpLatents) {
@@ -1523,6 +2349,43 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
         bool valid{false};
     };
     std::unordered_map<int, LastTpl> last_tpl_by_class;
+    std::unordered_map<std::string, cv::Mat> rgb_hist_cache;
+    struct LastAssigned {
+        cv::Rect box;
+        std::string key;
+        bool valid{false};
+    };
+    std::unordered_map<int, std::vector<LastAssigned>> last_assigned_by_class;
+    uint64_t matcher_new_templates = 0;
+    uint64_t matcher_id_switches = 0;
+    auto record_assignment = [&](int cls, const cv::Rect &box, const std::string &key, bool is_new) {
+        if (key.empty() || box.area() <= 0) return;
+        auto &vec = last_assigned_by_class[cls];
+        size_t best_idx = (size_t)-1;
+        float best_iou = 0.0f;
+        for (size_t i = 0; i < vec.size(); ++i) {
+            if (!vec[i].valid) continue;
+            float iou = iou_rect(vec[i].box, box);
+            if (iou > best_iou) {
+                best_iou = iou;
+                best_idx = i;
+            }
+        }
+        if (best_idx != (size_t)-1 && best_iou >= 0.5f && vec[best_idx].key != key) {
+            matcher_id_switches++;
+        }
+        if (is_new) matcher_new_templates++;
+        LastAssigned cur;
+        cur.box = box;
+        cur.key = key;
+        cur.valid = true;
+        if (best_idx != (size_t)-1 && best_iou >= 0.3f) {
+            vec[best_idx] = std::move(cur);
+        } else {
+            vec.push_back(std::move(cur));
+            if (vec.size() > 8) vec.erase(vec.begin());
+        }
+    };
 
     // Latent-key offline simulator state (YOLO only): template_id -> embedding/path
     uint32_t next_template_id = 1;
@@ -1533,9 +2396,62 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
         std::array<float, 32> emb_norm{};
         std::string path; // saved RGBA template path
         uint64_t use_count{0}; // how many times selected for this run (server-side)
+        int minted_frame{-1};
+        int last_used_frame{-1};
     };
     std::vector<LatentTpl> latent_bank;
     std::unordered_map<uint32_t, size_t> latent_id_to_index;
+    // Cache loaded RGBA templates to avoid per-detection disk IO (critical for performance).
+    std::unordered_map<uint32_t, cv::Mat> latent_rgba_cache;
+
+    // Optional: load prebuilt latent bank (e.g., from a build-index pass).
+    auto try_load_latent_bank = [&](const std::string &path) -> bool {
+        try {
+            std::ifstream f(path);
+            if (!f.is_open()) return false;
+            json bank; f >> bank;
+            if (!bank.is_array()) return false;
+            latent_bank.clear();
+            latent_id_to_index.clear();
+            uint32_t max_id = 0;
+            for (const auto &it : bank) {
+                if (!it.is_object()) continue;
+                LatentTpl t;
+                t.id = (uint32_t)it.value("id", 0);
+                t.cls = (int)it.value("cls", 0);
+                t.wh = cv::Size((int)it.value("w", 0), (int)it.value("h", 0));
+                t.path = it.value("path", "");
+                t.use_count = (uint64_t)it.value("use_count", 0ULL);
+                t.minted_frame = (int)it.value("minted_frame", -1);
+                t.last_used_frame = (int)it.value("last_used_frame", -1);
+                // emb
+                if (it.contains("emb") && it["emb"].is_array() && it["emb"].size() == 32) {
+                    for (int i = 0; i < 32; ++i) t.emb_norm[(size_t)i] = it["emb"][i].get<float>();
+                } else {
+                    continue; // invalid
+                }
+                if (t.id == 0 || t.wh.width <= 0 || t.wh.height <= 0 || t.path.empty()) continue;
+                latent_id_to_index[t.id] = latent_bank.size();
+                latent_bank.push_back(std::move(t));
+                if (t.id > max_id) max_id = t.id;
+            }
+            next_template_id = max_id + 1;
+            std::cout << "[LatentBank] Loaded " << latent_bank.size() << " templates from " << path << std::endl;
+            return !latent_bank.empty();
+        } catch (...) {
+            return false;
+        }
+    };
+    if (yolo_matcher == "latent_key" && !opt.pixelMode) {
+        std::string p = opt.latentBankLoadPath;
+        if (p.empty()) {
+            fs::path def = fs::path(opt.dictDir) / "latent_bank.json";
+            if (fs::exists(def)) p = def.string();
+        }
+        if (!p.empty()) {
+            (void)try_load_latent_bank(p);
+        }
+    }
     struct LastLatent {
         cv::Rect box;
         uint32_t id{0};
@@ -1576,19 +2492,39 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
 
     // Reliability stats
     uint64_t yolo_heal_skipped = 0; // regions not masked because not perfectly recoverable
+    uint64_t yolo_forced_masked = 0; // regions masked in upper-bound experiment mode
+    bool frame_mode_state_inited = false;
+    int frame_mode_state = 0;
+    int frame_mode_candidate = 0;
+    int frame_mode_candidate_count = 0;
     
     int frameIdx = 0;
     cv::Mat frame;
+    cv::Vec3b dominant_bgr(0, 255, 0);
+    cv::Mat bg_ema_f32;
+    bool bg_ema_inited = false;
     while (cap.read(frame)) {
         if (opt.maxFrames > 0 && frameIdx >= opt.maxFrames) break;
         cv::Mat processed = frame.clone();  // masked view (what server sends)
         cv::Mat recovered;                 // reconstructed client view from masked + side-channel
         double infer_ms = 0.0, paint_ms = 0.0, recover_ms = 0.0, dict_ms = 0.0, frame_total_ms = 0.0;
+        double preprocess_ms = 0.0, inference_ms = 0.0, postprocess_ms = 0.0;
+        double masking_ms = 0.0, encode_baseline_ms = 0.0, encode_masked_ms = 0.0, sei_build_ms = 0.0;
         auto t_frame_start = std::chrono::steady_clock::now();
+
+        // Per-frame latent/coverage counters (only meaningful for YOLO mode).
+        int frame_latent_minted = 0;
+        int frame_latent_reused = 0;
+        uint64_t frame_masked_bbox_px = 0;
+        uint64_t frame_masked_alpha_px = 0;
+        // Union mask of pixels we decide to modify on the server stream (before feather/composite).
+        // Used for fill generation (inpaint/bg_ema) and as an approximation for changed_pixels metrics.
+        cv::Mat mask_union_u8 = cv::Mat::zeros(frame.size(), CV_8UC1);
 
         std::vector<DL_RESULT> dets;
         double pixel_bootstrap_ms = 0.0;
         double pixel_roi_ms = 0.0;
+        double pixel_kalman_ms = 0.0;
         double pixel_band_ms = 0.0;
         double pixel_row_ms = 0.0;
         double pixel_flow_ms = 0.0;
@@ -1608,7 +2544,7 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                     cv::cvtColor(frame, frame_gray, cv::COLOR_BGR2GRAY);
                     cv::Canny(frame_gray, frame_edges, 50, 150);
                     if (!g_pixel_scales_calibrated) {
-                        calibrate_template_scales(frame_edges);
+                        calibrate_template_scales(frame_edges, opt);
                     }
 
                     bool need_bootstrap = (!pixelTracker.inited) ||
@@ -1625,105 +2561,172 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                     int bestTi = -1;
                     std::vector<std::pair<int, float>> ranked; // (ti, score)
                     bool ok2 = pixelTracker.roi_match(frame, frame_edges, frameIdx, opt, box, score, bestTi, ranked,
-                                                      pixel_roi_ms, pixel_scanned_roi);
+                                                      pixel_roi_ms, pixel_kalman_ms, pixel_scanned_roi);
                     float bestThr = pixel_template_accept_thr(bestTi, opt);
                     if (ok2 && score >= bestThr && box.area() > 0 && bestTi >= 0) {
                         pixelTracker.lostCount = 0;
 
-                        // Precompute bands once
+                        // Precompute bands around tracked ROI Y (avoid picking HUD edges).
                         std::vector<int> bandYs;
-                        PixelTracker::select_bands_from_edges(frame_edges, opt.pixelNumBands, opt.pixelBandMinSep, bandYs, pixel_row_ms);
+                        int cy = box.y + box.height / 2;
+                        int halfW = std::max(opt.pixelBandPadY * 3, box.height * 3);
+                        PixelTracker::select_bands_from_edges_window(frame_edges, cy, halfW,
+                                                                     opt.pixelNumBands, opt.pixelBandMinSep,
+                                                                     bandYs, pixel_row_ms);
                         pixel_bands_used = (int)bandYs.size();
 
-                        // Optical flow dy once
-                        float dy = 0.0f;
+                        // Optical flow dx/dy once
+                        float dx = 0.0f, dy = 0.0f;
                         if (opt.pixelUseFlow && !pixelTracker.prev_gray.empty()) {
-                            PixelTracker::estimate_flow_dy(pixelTracker.prev_gray, frame_gray,
-                                                           opt.pixelFlowMaxPts, dy, pixel_flow_ms);
+                            PixelTracker::estimate_flow_dxdy(pixelTracker.prev_gray, frame_gray,
+                                                           opt.pixelFlowMaxPts, dx, dy, pixel_flow_ms);
                             pixelTracker.prev_gray = frame_gray;
                         } else if (pixelTracker.prev_gray.empty() && opt.pixelUseFlow) {
                             pixelTracker.prev_gray = frame_gray;
                         }
 
-                        // Band-scan top-K templates (ranked by ROI score) to avoid missing variants (e.g. dark bricks).
-                        struct Peak { cv::Rect r; float s; int ti; };
-                        std::vector<Peak> all;
-                        int bandTopK = opt.pixelBandTopK;
-                        if (bandTopK <= 0) bandTopK = (int)ranked.size();
-                        if ((int)ranked.size() < bandTopK) bandTopK = (int)ranked.size();
+                        // Reduce flicker: refresh multi-peak detections only on bootstrap frames.
+                        // Between bootstraps, reuse the previous peak set shifted by global optical flow.
+                        if (need_bootstrap || pixelTracker.persisted_peaks.empty()) {
+                            // Band-scan top-K templates (ranked by ROI score) to avoid missing variants (e.g. dark bricks).
+                            struct Peak { cv::Rect r; float s; int ti; };
+                            std::vector<Peak> all;
+                            int bandTopK = opt.pixelBandTopK;
+                            if (bandTopK <= 0) bandTopK = (int)ranked.size();
+                            if ((int)ranked.size() < bandTopK) bandTopK = (int)ranked.size();
 
-                        double band_ms_sum = 0.0;
-                        int scanned_sum = 0;
-                        for (int k = 0; k < bandTopK; ++k) {
-                            int ti = ranked[(size_t)k].first;
-                            std::vector<std::pair<cv::Rect, float>> peaks;
-                            double ms_i = 0.0;
-                            int scanned_i = 0;
-                            pixelTracker.band_scan_multi_precomputed(frame, frame_edges, ti, bandYs, dy, opt,
-                                                                     peaks, ms_i, scanned_i);
-                            band_ms_sum += ms_i;
-                            scanned_sum += scanned_i;
-                            for (auto &pp : peaks) all.push_back(Peak{pp.first, pp.second, ti});
+                            double band_ms_sum = 0.0;
+                            int scanned_sum = 0;
+                            for (int k = 0; k < bandTopK; ++k) {
+                                int ti = ranked[(size_t)k].first;
+                                std::vector<std::pair<cv::Rect, float>> peaks;
+                                double ms_i = 0.0;
+                                int scanned_i = 0;
+                                pixelTracker.band_scan_multi_precomputed(frame, frame_edges, ti, bandYs, dy, opt,
+                                                                         peaks, ms_i, scanned_i);
+                                band_ms_sum += ms_i;
+                                scanned_sum += scanned_i;
+                                for (auto &pp : peaks) all.push_back(Peak{pp.first, pp.second, ti});
+                            }
+                            pixel_band_ms = band_ms_sum;
+                            pixel_scanned_band = scanned_sum;
+
+                            pixelTracker.persisted_peaks.clear();
+                            pixelTracker.persisted_peak_ti.clear();
+                            pixelTracker.persisted_peaks_frame = frameIdx;
+
+                            // If nothing found, fallback to best single detection.
+                            if (all.empty()) {
+                                pixelTracker.persisted_peaks.push_back(box);
+                                pixelTracker.persisted_peak_ti.push_back(bestTi);
+                            } else {
+                                // Cross-template NMS to reduce confusion from similar-looking units
+                                std::sort(all.begin(), all.end(), [](const Peak &a, const Peak &b){ return a.s > b.s; });
+                                auto iou = [](const cv::Rect &a, const cv::Rect &b)->float {
+                                    cv::Rect inter = a & b;
+                                    float ia = (float)std::max(0, inter.area());
+                                    float ua = (float)std::max(1, a.area() + b.area() - inter.area());
+                                    return ia / ua;
+                                };
+                                const float nms_iou = 0.3f;
+                                for (const auto &p : all) {
+                                    bool ok = true;
+                                    for (const auto &q : pixelTracker.persisted_peaks) {
+                                        if (iou(p.r, q) > nms_iou) { ok = false; break; }
+                                    }
+                                    if (ok) {
+                                        pixelTracker.persisted_peaks.push_back(p.r);
+                                        pixelTracker.persisted_peak_ti.push_back(p.ti);
+                                    }
+                                    if ((int)pixelTracker.persisted_peaks.size() >= opt.pixelMaxPeaks) break;
+                                }
+                            }
+                        } else {
+                            // Reuse previous peaks with flow-based shift.
+                            pixel_band_ms = 0.0;
+                            pixel_scanned_band = 0;
+                            int sdx = (int)std::round((double)dx);
+                            int sdy = (int)std::round((double)dy);
+                            if (sdx != 0 || sdy != 0) {
+                                for (auto &r : pixelTracker.persisted_peaks) {
+                                    r.x += sdx;
+                                    r.y += sdy;
+                                    r = PixelTracker::clamp_rect(r, frame.size());
+                                }
+                            }
                         }
-                        pixel_band_ms = band_ms_sum;
-                        pixel_scanned_band = scanned_sum;
 
-                        // If nothing found, fallback to best single detection
-                        if (all.empty()) {
+                        // Emit detections from the persisted peak set (current-frame coordinates).
+                        for (size_t pi = 0; pi < pixelTracker.persisted_peaks.size(); ++pi) {
+                            cv::Rect r = pixelTracker.persisted_peaks[pi];
+                            if (r.area() <= 0) continue;
+                            int ti = (pi < pixelTracker.persisted_peak_ti.size()) ? pixelTracker.persisted_peak_ti[pi] : bestTi;
+                            ti = std::max(0, std::min(ti, (int)g_pixel_templates.size() - 1));
+                            const auto &tmpl = g_pixel_templates[(size_t)ti];
                             DL_RESULT d{};
-                            d.confidence = score;
-                            d.box = box;
+                            d.confidence = 1.0f;
+                            d.box = r;
                             d.boxMask = cv::Mat::zeros(frame.size(), CV_8UC1);
-                            cv::rectangle(d.boxMask, box, cv::Scalar(255), cv::FILLED);
-                            const auto &tmpl = g_pixel_templates[(size_t)bestTi];
+                            cv::rectangle(d.boxMask, d.box, cv::Scalar(255), cv::FILLED);
                             d.classId = tmpl.kindId;
                             d.seiPath = tmpl.relPath;
                             dets.push_back(std::move(d));
-                        } else {
-                            // Cross-template NMS to reduce confusion from similar-looking units
-                            std::sort(all.begin(), all.end(), [](const Peak &a, const Peak &b){ return a.s > b.s; });
-                            auto iou = [](const cv::Rect &a, const cv::Rect &b)->float {
-                                cv::Rect inter = a & b;
-                                float ia = (float)std::max(0, inter.area());
-                                float ua = (float)std::max(1, a.area() + b.area() - inter.area());
-                                return ia / ua;
-                            };
-                            const float nms_iou = 0.3f;
-                            std::vector<Peak> kept;
-                            kept.reserve(all.size());
-                            for (const auto &p : all) {
-                                bool ok = true;
-                                for (const auto &q : kept) {
-                                    if (iou(p.r, q.r) > nms_iou) { ok = false; break; }
-                                }
-                                if (ok) kept.push_back(p);
-                                if ((int)kept.size() >= opt.pixelMaxPeaks) break;
+                        }
+
+                    } else {
+                        // If ROI match fails temporarily, keep the last persisted peak set alive
+                        // by shifting with optical flow. This avoids hard on/off flicker.
+                        pixelTracker.lostCount++;
+                        if (!pixelTracker.persisted_peaks.empty() &&
+                            opt.pixelUseFlow &&
+                            pixelTracker.lostCount <= std::max(1, opt.pixelLostMax) &&
+                            !pixelTracker.prev_gray.empty()) {
+                            float dx = 0.0f, dy = 0.0f;
+                            PixelTracker::estimate_flow_dxdy(pixelTracker.prev_gray, frame_gray,
+                                                             opt.pixelFlowMaxPts, dx, dy, pixel_flow_ms);
+                            pixelTracker.prev_gray = frame_gray;
+                            int sdx = (int)std::round((double)dx);
+                            int sdy = (int)std::round((double)dy);
+                            for (auto &r : pixelTracker.persisted_peaks) {
+                                r.x += sdx;
+                                r.y += sdy;
+                                r = PixelTracker::clamp_rect(r, frame.size());
                             }
-                            for (const auto &p : kept) {
+                            pixel_band_ms = 0.0;
+                            pixel_scanned_band = 0;
+                            // Emit detections from persisted peaks even on lost frames.
+                            for (size_t pi = 0; pi < pixelTracker.persisted_peaks.size(); ++pi) {
+                                cv::Rect r = pixelTracker.persisted_peaks[pi];
+                                if (r.area() <= 0) continue;
+                                int ti = (pi < pixelTracker.persisted_peak_ti.size()) ? pixelTracker.persisted_peak_ti[pi] : 0;
+                                ti = std::max(0, std::min(ti, (int)g_pixel_templates.size() - 1));
+                                const auto &tmpl = g_pixel_templates[(size_t)ti];
                                 DL_RESULT d{};
-                                d.confidence = p.s;
-                                d.box = p.r;
+                                d.confidence = 1.0f;
+                                d.box = r;
                                 d.boxMask = cv::Mat::zeros(frame.size(), CV_8UC1);
                                 cv::rectangle(d.boxMask, d.box, cv::Scalar(255), cv::FILLED);
-                                const auto &tmpl = g_pixel_templates[(size_t)p.ti];
                                 d.classId = tmpl.kindId;
                                 d.seiPath = tmpl.relPath;
                                 dets.push_back(std::move(d));
                             }
+                        } else if (opt.pixelUseFlow && pixelTracker.prev_gray.empty()) {
+                            pixelTracker.prev_gray = frame_gray;
                         }
-
-                    } else {
-                        pixelTracker.lostCount++;
                     }
                 }
             } else {
                 // Use YOLO model as before
                 if (yoloDetector.RunSession(frame, dets) != RET_OK) {
                     std::cerr << "Error running inference on frame " << frameIdx << std::endl;
-                    if (writer.isOpened()) writer.write(processed);
+                    if (writer.isOpen()) (void)writer.write(processed);
                     ++frameIdx; 
                     continue;
                 }
+                // Timing breakdown from the inference engine (YOLO only)
+                preprocess_ms = yoloDetector.LastPreprocessMs();
+                inference_ms = yoloDetector.LastInferMs();
+                postprocess_ms = yoloDetector.LastPostprocessMs(); // will be augmented by latent/gating work (dict_ms)
             }
             auto t1 = std::chrono::steady_clock::now();
             infer_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -1748,6 +2751,14 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                     latOut << emb[(size_t)i];
                 }
                 latOut << "]}\n";
+            }
+        }
+
+        // Dominant color update (only if requested).
+        if (opt.maskColor == "dominant") {
+            int period = std::max(1, opt.maskColorPeriod);
+            if (frameIdx == 0 || (frameIdx % period) == 0) {
+                dominant_bgr = dominant_color_bgr_hist(frame);
             }
         }
 
@@ -1784,8 +2795,22 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
             if (opt.pixelMode) {
                 // Pixel mode: paint with kind-consistent color (better motion prediction),
                 // while stitching uses template key (seiPath).
+                // If user explicitly requests a non-default masking color strategy (e.g. dominant),
+                // honor it for pixel mode too; otherwise keep kind-consistent colors.
                 cv::Vec3b maskColor = kind_color_from_kind_id(d.classId);
+                if (opt.maskColor == "dominant" || opt.maskColor == "black" || opt.maskColor == "brown" || opt.maskColor == "rgb") {
+                    maskColor = choose_mask_color_bgr(opt, /*classId=*/d.classId, dominant_bgr);
+                }
                 OfflineProcessor::paint_mask_color(processed, d.boxMask, d.box, maskColor, opt.paintAlpha);
+                // Pixel-mode: keep existing behavior (not part of feather/fill experiments).
+                try {
+                    cv::Rect safe = d.box & cv::Rect(0, 0, frame.cols, frame.rows);
+                    if (safe.area() > 0 && !mask_union_u8.empty()) {
+                        cv::Mat mroi = d.boxMask(safe);
+                        cv::Mat dst = mask_union_u8(safe);
+                        cv::bitwise_or(dst, mroi, dst);
+                    }
+                } catch (...) {}
 
                 if (seiOut.is_open()) {
                     SEIRegion r{};
@@ -1810,8 +2835,27 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                 }
                 if (maskROI.empty()) continue;
 
+                // Upper-bound experiment: paint ALL detected masks regardless of healability/template match.
+                // This estimates the best possible H.264 bitrate reduction if object regions were perfectly
+                // removable/compressible. Recovery output will NOT be correct.
+                if (opt.yoloForceMaskAll) {
+                    // Mark for masking; actual fill is applied after we decide per-frame fill.
+                    try {
+                        cv::Rect safe = d.box & cv::Rect(0, 0, frame.cols, frame.rows);
+                        if (safe.area() > 0) {
+                            cv::Mat mroi = d.boxMask(safe);
+                            cv::Mat dst = mask_union_u8(safe);
+                            cv::bitwise_or(dst, mroi, dst);
+                        }
+                    } catch (...) {}
+                    if (di < det_masked.size()) det_masked[di] = 1;
+                    if (di < det_stitch_boxes.size()) det_stitch_boxes[di] = d.box;
+                    yolo_forced_masked++;
+                    continue;
+                }
+
                 // YOLO latent-key mode: assign template_id by maskCoeff embedding similarity.
-                if (opt.yoloLatentKey) {
+                if (yolo_matcher == "latent_key") {
                     auto t_dict0 = std::chrono::steady_clock::now();
 
                     // Normalize embedding
@@ -1819,7 +2863,10 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
 
                     // Hybrid sampling: base periodic mint + motion-triggered boost
                     bool force_mint = false;
-                    if (opt.latentSamplePeriod > 0 && (frameIdx % opt.latentSamplePeriod) == 0) {
+                    // Build-index: aggressively mint candidates (but allow merge/skip thresholds to compact)
+                    if (opt.buildIndexOnly) {
+                        force_mint = true;
+                    } else if (opt.latentSamplePeriod > 0 && (frameIdx % opt.latentSamplePeriod) == 0) {
                         force_mint = true;
                     }
 
@@ -1844,10 +2891,12 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                         }
                         }
                     }
-                    auto itBoost = latent_boost_until_frame.find(d.classId);
-                    if (itBoost != latent_boost_until_frame.end() && frameIdx < itBoost->second) {
-                        // In boost window, mint every frame for fluency
-                        force_mint = true;
+                    if (!opt.buildIndexOnly) {
+                        auto itBoost = latent_boost_until_frame.find(d.classId);
+                        if (itBoost != latent_boost_until_frame.end() && frameIdx < itBoost->second) {
+                            // In boost window, mint every frame for fluency
+                            force_mint = true;
+                        }
                     }
 
                     // Temporal stability: if last template for this class overlaps strongly, prefer it
@@ -1926,24 +2975,41 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                     cv::Rect stitch_box = d.box;
                     if (opt.yoloHealOnly) {
                         healable_now = false;
+                        const bool is_gop_i = (opt.gopSize > 0) ? ((frameIdx % opt.gopSize) == 0) : false;
                         // Try chosen_id first (if it is a reuse candidate)
                         auto try_id = [&](uint32_t cand_id) -> bool {
                             auto itIdx = latent_id_to_index.find(cand_id);
                             if (itIdx == latent_id_to_index.end()) return false;
                             const auto &tpl = latent_bank[itIdx->second];
-                            cv::Mat img = cv::imread(tpl.path, cv::IMREAD_UNCHANGED);
-                            if (img.empty()) return false;
-                            if (img.cols != d.box.width || img.rows != d.box.height) {
-                                cv::resize(img, img, d.box.size(), 0, 0, cv::INTER_NEAREST);
+                            cv::Mat base;
+                            auto itC = latent_rgba_cache.find(cand_id);
+                            if (itC != latent_rgba_cache.end()) {
+                                base = itC->second;
+                            } else {
+                                base = cv::imread(tpl.path, cv::IMREAD_UNCHANGED);
+                                if (base.empty()) return false;
+                                latent_rgba_cache.emplace(cand_id, base);
                             }
-                            // Allow a small shift to account for bbox jitter between frames.
+                            cv::Mat img = base;
+                            if (img.cols != d.box.width || img.rows != d.box.height) {
+                                cv::resize(base, img, d.box.size(), 0, 0, cv::INTER_NEAREST);
+                            }
+                            // Alignment/match: use alpha-masked RGB MSE to handle segmentation jitter.
                             int dx = 0, dy = 0;
-                            double extra_ratio = 1e9;
-                            if (!best_alpha_mask_offset(img, d.boxMask, d.box, /*max_shift=*/2, dx, dy, extra_ratio)) {
+                            double mse = 1e18;
+                            int max_shift = std::max(0, opt.yoloHealMaxShiftPx);
+                            if (!best_alpha_rgb_offset_mse(img, frame, d.box, max_shift, dx, dy, mse)) return false;
+                            if (mse > (double)opt.yoloHealAppearanceMseThr) return false;
+                            // Also require that template alpha still overlaps the current segmentation mask at least a bit,
+                            // to avoid stitching a totally unrelated template (wrong gun from the pool).
+                            double cov = template_alpha_mask_coverage(img, d.boxMask, d.box, dx, dy);
+                            if (cov < (double)opt.yoloHealMinMaskCoverage) return false;
+                            stitch_box = d.box + cv::Point(dx, dy);
+                            if (!template_alpha_matches_mask(img, d.boxMask, stitch_box,
+                                                             opt.yoloHealMaskIouThr,
+                                                             opt.yoloHealMaskExtraThr)) {
                                 return false;
                             }
-                            if (extra_ratio > (double)opt.yoloHealMaskExtraThr) return false;
-                            stitch_box = d.box + cv::Point(dx, dy);
                             return true;
                         };
 
@@ -1976,9 +3042,55 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                                 }
                             }
                         }
+
+                        // Fallback: if still not healable, reuse the most similar latent used within a short window.
+                        // This increases masking ratio while keeping temporal coherence (vision persistence).
+                        if (!healable_now && opt.yoloHealFallbackWindowFrames > 0) {
+                            float bestSim2 = -1.0f;
+                            uint32_t bestId2 = 0;
+                            const int win = std::max(1, opt.yoloHealFallbackWindowFrames);
+                            const float minSim = is_gop_i ? opt.yoloHealFallbackMinSimI : opt.yoloHealFallbackMinSim;
+                            for (const auto &tpl : latent_bank) {
+                                if (tpl.cls != d.classId) continue;
+                                if (tpl.last_used_frame < 0) continue;
+                                if ((frameIdx - tpl.last_used_frame) > win) continue;
+                                float sim = cosine_sim_32(emb, tpl.emb_norm);
+                                if (sim > bestSim2) { bestSim2 = sim; bestId2 = tpl.id; }
+                            }
+                            if (bestId2 != 0 && bestSim2 >= minSim) {
+                                if (try_id(bestId2)) {
+                                    chosen_id = bestId2;
+                                    healable_now = true;
+                                }
+                            }
+                        }
                     }
 
-                    if (chosen_id == 0 || force_mint) {
+                    if (opt.latentNoMint) {
+                        // Match-only mode from a prebuilt pool:
+                        // - Never mint new templates, even on periodic/motion "force_mint" frames.
+                        // - If we can't find a reusable id, skip this region (raw transmit).
+                        force_mint = false;
+                        if (chosen_id == 0) {
+                            // Debug: for early frames, print best similarity so we can tell whether this is
+                            // a thresholding problem (bestSim too low) or a class/bank mismatch (bestId==0).
+                            if (frameIdx < 3) {
+                                std::cout << "[LatentNoMint] skip frame=" << frameIdx
+                                          << " det_cls=" << d.classId
+                                          << " bestId=" << bestId
+                                          << " bestSim=" << bestSim
+                                          << " thr=" << opt.latentCosineThreshold
+                                          << " bank_size=" << latent_bank.size()
+                                          << std::endl;
+                            }
+                            yolo_heal_skipped++;
+                            auto t_dict1 = std::chrono::steady_clock::now();
+                            dict_ms += std::chrono::duration<double, std::milli>(t_dict1 - t_dict0).count();
+                            continue;
+                        }
+                    }
+
+                    if (!opt.latentNoMint && (chosen_id == 0 || force_mint)) {
                         // Mint new template_id and save RGBA template
                         chosen_id = next_template_id++;
                         is_new = true;
@@ -1999,9 +3111,12 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                         tpl.emb_norm = emb;
                         tpl.path = out_png.string();
                         tpl.use_count = 1;
+                        tpl.minted_frame = frameIdx;
+                        tpl.last_used_frame = frameIdx;
                         latent_id_to_index[tpl.id] = latent_bank.size();
                         latent_bank.push_back(std::move(tpl));
                         latent_minted++;
+                        frame_latent_minted++;
                         if (force_mint) {
                             latent_forced_mints++;
                             auto itB = latent_boost_until_frame.find(d.classId);
@@ -2012,15 +3127,18 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                     } else {
                         matched_occurrences++;
                         latent_reused++;
+                        frame_latent_reused++;
                         auto itIdx2 = latent_id_to_index.find(chosen_id);
                         if (itIdx2 != latent_id_to_index.end()) {
                             latent_bank[itIdx2->second].use_count++;
+                            latent_bank[itIdx2->second].last_used_frame = frameIdx;
                         }
                     }
 
                     det_tplids[di] = chosen_id;
                     det_is_new[di] = is_new ? 1 : 0;
                     det_stitch_boxes[di] = stitch_box;
+                    record_assignment(d.classId, safeBox, std::to_string(chosen_id), is_new);
                     if (is_new) {
                         yolo_new_tplids_this_frame.insert(chosen_id);
                     }
@@ -2051,27 +3169,63 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                     auto t_dict1 = std::chrono::steady_clock::now();
                     dict_ms += std::chrono::duration<double, std::milli>(t_dict1 - t_dict0).count();
 
-                    // Paint masked stream only when healable (or when heal-only is disabled).
+                    // Build-index mode: only prefill the pool; skip painting/SEI (much faster).
+                    if (opt.buildIndexOnly) {
+                        continue;
+                    }
+
+                    // Mark masked pixels (union mask) only when healable (or when heal-only is disabled).
                     if (!opt.yoloHealOnly || healable_now) {
-                        cv::Vec3b color = opt.yoloClassConsistentColor ? yolo_class_color(d.classId) : cv::Vec3b(0, 255, 0);
                         if (opt.yoloHealOnly) {
-                            // Heal-only: paint exactly what we can heal (template alpha), avoiding green edges.
+                            // Heal-only: union mask is template alpha (what the client can stitch).
                             auto itIdx = latent_id_to_index.find(chosen_id);
                             if (itIdx != latent_id_to_index.end()) {
                                 const auto &tpl = latent_bank[itIdx->second];
-                                cv::Mat img = cv::imread(tpl.path, cv::IMREAD_UNCHANGED);
-                                if (!img.empty()) {
+                                cv::Mat base;
+                                auto itC = latent_rgba_cache.find(chosen_id);
+                                if (itC != latent_rgba_cache.end()) {
+                                    base = itC->second;
+                                } else {
+                                    base = cv::imread(tpl.path, cv::IMREAD_UNCHANGED);
+                                    if (!base.empty()) latent_rgba_cache.emplace(chosen_id, base);
+                                }
+                                if (!base.empty()) {
+                                    cv::Mat img = base;
                                     if (img.cols != stitch_box.width || img.rows != stitch_box.height) {
-                                        cv::resize(img, img, stitch_box.size(), 0, 0, cv::INTER_NEAREST);
+                                        cv::resize(base, img, stitch_box.size(), 0, 0, cv::INTER_NEAREST);
                                     }
-                                    paint_bbox_alpha_color(processed, img, stitch_box, color);
+                                    cv::Rect safe = stitch_box & cv::Rect(0, 0, frame.cols, frame.rows);
+                                    frame_masked_bbox_px += (uint64_t)std::max(0, safe.area());
+                                    frame_masked_alpha_px += count_alpha_nonzero_in_safe(img, stitch_box, safe);
+                                    if (safe.area() > 0) {
+                                        cv::Mat alpha;
+                                        cv::extractChannel(img, alpha, 3);
+                                        int ax0 = safe.x - stitch_box.x;
+                                        int ay0 = safe.y - stitch_box.y;
+                                        if (ax0 >= 0 && ay0 >= 0 &&
+                                            ax0 + safe.width <= alpha.cols &&
+                                            ay0 + safe.height <= alpha.rows) {
+                                            cv::Mat aroi = alpha(cv::Rect(ax0, ay0, safe.width, safe.height));
+                                            cv::Mat dst = mask_union_u8(safe);
+                                            cv::bitwise_or(dst, aroi, dst);
+                                        }
+                                    }
                                 }
                             }
                         } else {
-                            OfflineProcessor::paint_mask_color(processed, d.boxMask, d.box, color, opt.paintAlpha);
+                            cv::Rect safe = d.box & cv::Rect(0, 0, frame.cols, frame.rows);
+                            frame_masked_bbox_px += (uint64_t)std::max(0, safe.area());
+                            try {
+                                cv::Mat mroi = d.boxMask(safe);
+                                frame_masked_alpha_px += (uint64_t)cv::countNonZero(mroi);
+                                if (safe.area() > 0) {
+                                    cv::Mat dst = mask_union_u8(safe);
+                                    cv::bitwise_or(dst, mroi, dst);
+                                }
+                            } catch (...) {}
                         }
-                        det_masked[di] = 1;
 
+                        det_masked[di] = 1;
                         if (seiOut.is_open()) {
                             SEIRegion r{};
                             r.id = chosen_id; // template_id (stable across frames)
@@ -2090,19 +3244,25 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                     continue;
                 }
 
-                // pHash-keying mode (legacy simulator): position-invariant pHash on cropped ROI.
+                // Non-latent matcher family: pHash, IoU-only, or RGB histogram.
                 auto t_dict0 = std::chrono::steady_clock::now();
                 uint64_t ph = OfflineProcessor::mask_phash64(maskROI);
-                // Temporal stability: if last template for this class overlaps strongly and is phash-close,
-                // prefer it to avoid bouncing between near-duplicates.
                 std::string matched;
                 auto itLast = last_tpl_by_class.find(d.classId);
                 if (itLast != last_tpl_by_class.end() && itLast->second.valid) {
                     float iou = iou_rect(itLast->second.box, safeBox);
                     if (iou >= 0.7f) {
-                        int dist = OfflineProcessor::hamming64(ph, itLast->second.phash64);
-                        if (dist <= opt.phashThreshold + 2) {
-                            // reuse last hash if it's still in dict
+                        if (yolo_matcher == "iou_only") {
+                            if (processor.getDict().find(itLast->second.hash) != processor.getDict().end()) {
+                                matched = itLast->second.hash;
+                            }
+                        } else if (yolo_matcher == "phash") {
+                            int dist = OfflineProcessor::hamming64(ph, itLast->second.phash64);
+                            if (dist <= opt.phashThreshold + 2 &&
+                                processor.getDict().find(itLast->second.hash) != processor.getDict().end()) {
+                                matched = itLast->second.hash;
+                            }
+                        } else if (yolo_matcher == "rgb_hist") {
                             if (processor.getDict().find(itLast->second.hash) != processor.getDict().end()) {
                                 matched = itLast->second.hash;
                             }
@@ -2110,7 +3270,15 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                     }
                 }
                 if (matched.empty()) {
-                    matched = find_best_phash_match(processor.getDict(), ph, d.classId, safeBox.size(), opt.phashThreshold);
+                    if (yolo_matcher == "phash") {
+                        matched = find_best_phash_match(processor.getDict(), ph, d.classId, safeBox.size(), opt.phashThreshold);
+                    } else if (yolo_matcher == "rgb_hist") {
+                        cv::Mat roi_bgr;
+                        try { roi_bgr = frame(safeBox).clone(); } catch (...) { roi_bgr.release(); }
+                        if (!roi_bgr.empty()) {
+                            matched = find_best_rgb_hist_match(processor.getDict(), roi_bgr, maskROI, d.classId, safeBox.size(), rgb_hist_cache);
+                        }
+                    }
                 }
                 bool is_new = false;
                 std::string canon;
@@ -2148,6 +3316,7 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                 lt.phash64 = ph;
                 lt.valid = true;
                 last_tpl_by_class[d.classId] = std::move(lt);
+                record_assignment(d.classId, safeBox, canon, is_new);
 
                 // Heal-only gating (legacy pHash mode): only mask if recoverable with an existing template.
                 bool healable_now = true;
@@ -2168,7 +3337,9 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                                 if (best_alpha_mask_offset(tpl, d.boxMask, d.box, /*max_shift=*/2, dx, dy, extra_ratio) &&
                                     extra_ratio <= (double)opt.yoloHealMaskExtraThr) {
                                     stitch_box = d.box + cv::Point(dx, dy);
-                                    healable_now = true;
+                                    healable_now = template_alpha_matches_mask(tpl, d.boxMask, stitch_box,
+                                                                              opt.yoloHealMaskIouThr,
+                                                                              opt.yoloHealMaskExtraThr);
                                 }
                             }
                         }
@@ -2176,25 +3347,16 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                 }
 
                 if (!opt.yoloHealOnly || healable_now) {
-                    // Visualization (server masked stream)
-                    cv::Vec3b color = opt.yoloClassConsistentColor
-                                      ? yolo_class_color(d.classId)
-                                      : OfflineProcessor::deterministic_color_from_hash(canon);
-                    if (opt.yoloHealOnly) {
-                        const auto &dictRef = processor.getDict();
-                        auto it = dictRef.find(canon);
-                        if (it != dictRef.end()) {
-                            cv::Mat tpl = cv::imread(it->second.path, cv::IMREAD_UNCHANGED);
-                            if (!tpl.empty()) {
-                                if (tpl.cols != stitch_box.width || tpl.rows != stitch_box.height) {
-                                    cv::resize(tpl, tpl, stitch_box.size(), 0, 0, cv::INTER_NEAREST);
-                                }
-                                paint_bbox_alpha_color(processed, tpl, stitch_box, color);
-                            }
+                    // Legacy pHash path: for fill/feather experiments we treat it like non-heal-only,
+                    // using the segmentation mask union.
+                    try {
+                        cv::Rect safe = d.box & cv::Rect(0, 0, frame.cols, frame.rows);
+                        if (safe.area() > 0) {
+                            cv::Mat mroi = d.boxMask(safe);
+                            cv::Mat dst = mask_union_u8(safe);
+                            cv::bitwise_or(dst, mroi, dst);
                         }
-                    } else {
-                        OfflineProcessor::paint_mask_color(processed, d.boxMask, d.box, color, opt.paintAlpha);
-                    }
+                    } catch (...) {}
                     det_masked[di] = 1;
                     det_stitch_boxes[di] = stitch_box;
 
@@ -2215,8 +3377,34 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                 }
             }
         }
+        // Apply fill + feather (YOLO mode only; pixel mode already painted above).
+        if (!opt.pixelMode) {
+            // Build fill frame (solid/blur/bg_ema/inpaint) using union mask for inpaint/bg_ema updates.
+            cv::Mat fill_bgr = make_fill_frame_bgr(frame, mask_union_u8, opt, dominant_bgr, bg_ema_f32, bg_ema_inited);
+            if (!fill_bgr.empty() && cv::countNonZero(mask_union_u8) > 0) {
+                // Composite only within per-detection boxes to keep it fast.
+                for (size_t di = 0; di < dets.size(); ++di) {
+                    if (di < det_masked.size() && det_masked[di] == 0) continue;
+                    cv::Rect box = (di < det_stitch_boxes.size() && det_stitch_boxes[di].area() > 0) ? det_stitch_boxes[di] : dets[di].box;
+                    apply_fill_with_feather_bbox(processed, frame, fill_bgr, mask_union_u8, box, opt.featherPx);
+                }
+            }
+        }
         auto t_paint1 = std::chrono::steady_clock::now();
         paint_ms = std::chrono::duration<double, std::milli>(t_paint1 - t_paint0).count();
+        masking_ms = paint_ms;
+        // Postprocess includes YOLO postprocess + latent selection/gating (dict_ms).
+        postprocess_ms += dict_ms;
+
+        // Build-index only: do not generate masked/recovered outputs. We still want to populate
+        // templates + latent bank for the next (heal-only) run.
+        if (opt.buildIndexOnly) {
+            ++frameIdx;
+            if (frameIdx % 200 == 0) {
+                std::cout << "Indexed " << frameIdx << "/" << cap.get(cv::CAP_PROP_FRAME_COUNT) << " frames." << std::endl;
+            }
+            continue;
+        }
 
         // Client receives the masked stream, then reconstructs using side channel (templates/dict).
         recovered = processed.clone();
@@ -2240,7 +3428,7 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                     matched_occurrences++; // treat as matched since we can always recover from template set
                 }
             } else {
-                if (opt.yoloLatentKey) {
+                if (yolo_matcher == "latent_key") {
                     uint32_t tid = det_tplids[di];
                     if (!tid) continue;
                     bool is_new_for_client = det_is_new[di] || (yolo_new_tplids_this_frame.find(tid) != yolo_new_tplids_this_frame.end());
@@ -2324,19 +3512,69 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
         auto t_rec1 = std::chrono::steady_clock::now();
         recover_ms = std::chrono::duration<double, std::milli>(t_rec1 - t_rec0).count();
 
+        // Determine ref/raw status and "successfully masked" count.
+        int ref_regions = 0;
+        if (opt.pixelMode) {
+            ref_regions = (int)sei_regions.size();
+        } else {
+            // In YOLO mode, sei_regions contains only actually-masked regions (except force-mask-all).
+            if (!sei_regions.empty()) {
+                ref_regions = (int)sei_regions.size();
+            } else if (!det_masked.empty()) {
+                for (uint8_t v : det_masked) if (v) ref_regions++;
+            }
+        }
+        int frame_flags_raw_i = ref_regions > 0 ? 1 : 0; // 0=raw, 1=ref
+        int frame_flags_i = frame_flags_raw_i;
+        if (opt.frameModeHysteresis) {
+            if (!frame_mode_state_inited) {
+                frame_mode_state_inited = true;
+                frame_mode_state = frame_flags_raw_i;
+                frame_mode_candidate = frame_mode_state;
+                frame_mode_candidate_count = 0;
+            } else if (frame_flags_raw_i == frame_mode_state) {
+                frame_mode_candidate = frame_mode_state;
+                frame_mode_candidate_count = 0;
+            } else {
+                if (frame_flags_raw_i != frame_mode_candidate) {
+                    frame_mode_candidate = frame_flags_raw_i;
+                    frame_mode_candidate_count = 1;
+                } else {
+                    frame_mode_candidate_count++;
+                }
+                if (frame_mode_candidate_count >= std::max(1, opt.frameModeHysteresisConfirmFrames)) {
+                    frame_mode_state = frame_mode_candidate;
+                    frame_mode_candidate_count = 0;
+                }
+            }
+            frame_flags_i = frame_mode_state;
+        }
+        cv::Mat emittedFrame = (frame_flags_i != 0) ? processed : frame;
+        cv::Mat deliveredRecovered = (frame_flags_i != 0) ? recovered : frame;
+        if (frame_flags_i == 0) {
+            ref_regions = 0;
+            sei_regions.clear();
+            frame_masked_bbox_px = 0;
+            frame_masked_alpha_px = 0;
+            mask_union_u8.setTo(cv::Scalar(0));
+        }
+
         if (seiOut.is_open()) {
+            auto t_sei0 = std::chrono::steady_clock::now();
             uint64_t pts = (uint64_t)frameIdx;
-            uint8_t frame_flags = sei_regions.empty() ? 0 : 1; // 0=raw, 1=ref
+            uint8_t frame_flags = (uint8_t)frame_flags_i;
             std::vector<uint8_t> payload = build_msk1_payload((uint64_t)frameIdx, pts, sei_regions, /*version=*/4, frame_flags);
             uint32_t len = (uint32_t)payload.size();
             seiOut.write(reinterpret_cast<const char*>(&len), sizeof(len));
             if (len) seiOut.write(reinterpret_cast<const char*>(payload.data()), len);
+            auto t_sei1 = std::chrono::steady_clock::now();
+            sei_build_ms = std::chrono::duration<double, std::milli>(t_sei1 - t_sei0).count();
         }
 
         // Record quality metrics between baseline and masked frame
-        if (frame.size() == processed.size()) {
-            double ssim = computeSSIM(frame, processed);
-            double psnr = computePSNR(frame, processed);
+        if (frame.size() == emittedFrame.size()) {
+            double ssim = computeSSIM(frame, emittedFrame);
+            double psnr = computePSNR(frame, emittedFrame);
             ssim_sum += ssim;
             psnr_sum += psnr;
             metric_frames++;
@@ -2344,38 +3582,36 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
             ssim_values.push_back(ssim);
             psnr_values.push_back(psnr);
 
-            if (opt.recordTiming) {
-                // Pixel-specific breakdown (0 if not pixel mode)
-                t_pixel_bootstrap_ms.push_back(opt.pixelMode ? pixel_bootstrap_ms : 0.0);
-                t_pixel_roi_ms.push_back(opt.pixelMode ? pixel_roi_ms : 0.0);
-                t_pixel_scanned_bootstrap.push_back(opt.pixelMode ? pixel_scanned_bootstrap : 0);
-                t_pixel_scanned_roi.push_back(opt.pixelMode ? pixel_scanned_roi : 0);
-                t_pixel_band_ms.push_back(opt.pixelMode ? pixel_band_ms : 0.0);
-                t_pixel_scanned_band.push_back(opt.pixelMode ? pixel_scanned_band : 0);
-                t_pixel_row_ms.push_back(opt.pixelMode ? pixel_row_ms : 0.0);
-                t_pixel_flow_ms.push_back(opt.pixelMode ? pixel_flow_ms : 0.0);
-                t_pixel_bands_used.push_back(opt.pixelMode ? pixel_bands_used : 0);
+            // Pixel-specific breakdown: always record so CSV is meaningful even if --timing is omitted.
+            t_pixel_bootstrap_ms.push_back(opt.pixelMode ? pixel_bootstrap_ms : 0.0);
+            t_pixel_roi_ms.push_back(opt.pixelMode ? pixel_roi_ms : 0.0);
+            t_pixel_scanned_bootstrap.push_back(opt.pixelMode ? pixel_scanned_bootstrap : 0);
+            t_pixel_scanned_roi.push_back(opt.pixelMode ? pixel_scanned_roi : 0);
+            t_pixel_band_ms.push_back(opt.pixelMode ? pixel_band_ms : 0.0);
+            t_pixel_scanned_band.push_back(opt.pixelMode ? pixel_scanned_band : 0);
+            t_pixel_row_ms.push_back(opt.pixelMode ? pixel_row_ms : 0.0);
+            t_pixel_flow_ms.push_back(opt.pixelMode ? pixel_flow_ms : 0.0);
+            t_pixel_bands_used.push_back(opt.pixelMode ? pixel_bands_used : 0);
 
-                if (opt.pixelMode) {
-                    std::unordered_map<std::string, int> cnt;
-                    for (const auto &d : dets) {
-                        if (d.confidence < opt.confThreshold) continue;
-                        if (d.seiPath.empty()) continue;
-                        cnt[d.seiPath] += 1;
-                    }
-                    json m = json::object();
-                    for (const auto &kv : cnt) m[kv.first] = kv.second;
-                    t_pixel_template_counts.push_back(std::move(m));
-                } else {
-                    t_pixel_template_counts.push_back(json::object());
+            if (opt.pixelMode) {
+                std::unordered_map<std::string, int> cnt;
+                for (const auto &d : dets) {
+                    if (d.confidence < opt.confThreshold) continue;
+                    if (d.seiPath.empty()) continue;
+                    cnt[d.seiPath] += 1;
                 }
+                json m = json::object();
+                for (const auto &kv : cnt) m[kv.first] = kv.second;
+                t_pixel_template_counts.push_back(std::move(m));
+            } else {
+                t_pixel_template_counts.push_back(json::object());
             }
         }
 
         // Record quality metrics between baseline and recovered frame
-        if (frame.size() == recovered.size()) {
-            double ssim_r = computeSSIM(frame, recovered);
-            double psnr_r = computePSNR(frame, recovered);
+        if (frame.size() == deliveredRecovered.size()) {
+            double ssim_r = computeSSIM(frame, deliveredRecovered);
+            double psnr_r = computePSNR(frame, deliveredRecovered);
             rec_ssim_sum += ssim_r;
             rec_psnr_sum += psnr_r;
             rec_metric_frames++;
@@ -2383,12 +3619,78 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
             rec_psnr_values.push_back(psnr_r);
         }
 
-        if (origWriter.isOpened()) origWriter.write(frame);
-        if (writer.isOpened()) writer.write(processed);
-        if (recWriter.isOpened()) recWriter.write(recovered);
+        // Encode proxy times (stdin write time + SEI build time on masked stream).
+        if (origWriter.isOpen()) {
+            auto t0 = std::chrono::steady_clock::now();
+            (void)origWriter.write(frame);
+            auto t1 = std::chrono::steady_clock::now();
+            encode_baseline_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        }
+        double masked_write_ms = 0.0;
+        if (writer.isOpen()) {
+            auto t0 = std::chrono::steady_clock::now();
+            (void)writer.write(emittedFrame);
+            auto t1 = std::chrono::steady_clock::now();
+            masked_write_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        }
+        encode_masked_ms = masked_write_ms + sei_build_ms;
+        if (recWriter.isOpen()) (void)recWriter.write(deliveredRecovered);
 
         auto t_frame_end = std::chrono::steady_clock::now();
         frame_total_ms = std::chrono::duration<double, std::milli>(t_frame_end - t_frame_start).count();
+
+        // Per-frame CSV fields (always recorded into report.json/per_frame)
+        // Model object count: detections passing conf threshold with a non-empty mask.
+        int model_cnt = 0;
+        for (const auto &d : dets) {
+            if (d.confidence < opt.confThreshold) continue;
+            if (d.boxMask.empty()) continue;
+            model_cnt++;
+        }
+        t_object_present_model.push_back(model_cnt);
+        t_object_successfully_masked.push_back(ref_regions);
+        t_frame_flags.push_back(frame_flags_i);
+        t_frame_flags_raw.push_back(frame_flags_raw_i);
+        t_latent_minted_regions.push_back(frame_latent_minted);
+        t_latent_reused_regions.push_back(frame_latent_reused);
+        double frame_px = (double)std::max<int64_t>(1, (int64_t)frame.cols * (int64_t)frame.rows);
+        t_masked_bbox_pct.push_back(100.0 * (double)frame_masked_bbox_px / frame_px);
+        t_masked_alpha_pct.push_back(100.0 * (double)frame_masked_alpha_px / frame_px);
+        int changed = 0;
+        // Approximation: changed pixels count based on union mask (feather may reduce actual changes slightly).
+        try { changed = cv::countNonZero(mask_union_u8); } catch (...) { changed = 0; }
+        t_changed_pixels.push_back(changed);
+        t_changed_pixels_pct.push_back(100.0 * (double)changed / frame_px);
+
+        // Cross-game timing breakdown
+        if (opt.pixelMode) {
+            preprocess_ms = 0.0;
+            inference_ms = infer_ms;
+            postprocess_ms = 0.0;
+        } else {
+            if (preprocess_ms <= 0.0 && inference_ms <= 0.0 && postprocess_ms <= 0.0) {
+                inference_ms = infer_ms;
+            }
+        }
+        t_preprocess_ms.push_back(preprocess_ms);
+        t_inference_ms.push_back(inference_ms);
+        t_postprocess_ms.push_back(postprocess_ms);
+        t_masking_ms.push_back(masking_ms);
+        t_encode_baseline_ms.push_back(encode_baseline_ms);
+        t_encode_masked_ms.push_back(encode_masked_ms);
+        t_stitching_ms.push_back(recover_ms);
+
+        // Pixel counters:
+        // - ROI filter (Kalman): kalman predict+correct time inside roi_match()
+        // - Template matching: bootstrap + ROI match (minus kalman) + row band selection + band scan
+        // - Motion filter: optical flow stabilization
+        double pixel_template_matching_ms = 0.0;
+        if (opt.pixelMode) {
+            pixel_template_matching_ms =
+                pixel_bootstrap_ms +
+                std::max(0.0, pixel_roi_ms - pixel_kalman_ms) +
+                pixel_row_ms + pixel_band_ms;
+        }
 
         if (opt.recordTiming) {
             t_infer_ms.push_back(infer_ms);
@@ -2397,9 +3699,16 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
             t_recover_ms.push_back(recover_ms);
             t_total_ms.push_back(frame_total_ms);
         }
+        if (opt.dumpFrameCache && originalFrameCache.is_open() && maskedFrameCache.is_open()) {
+            cv::Mat frameWrite = frame.isContinuous() ? frame : frame.clone();
+            cv::Mat processedWrite = emittedFrame.isContinuous() ? emittedFrame : emittedFrame.clone();
+            const size_t frameBytes = (size_t)width * (size_t)height * 3;
+            originalFrameCache.write(reinterpret_cast<const char*>(frameWrite.data), (std::streamsize)frameBytes);
+            maskedFrameCache.write(reinterpret_cast<const char*>(processedWrite.data), (std::streamsize)frameBytes);
+        }
 
         ++frameIdx;
-        if (frameIdx % 50 == 0) {
+        if (frameIdx % 200 == 0) {
             std::cout << "Processed " << frameIdx << "/" << cap.get(cv::CAP_PROP_FRAME_COUNT) << " frames." << std::endl;
         }
     }
@@ -2415,8 +3724,57 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
     double avg_psnr = metric_frames ? (psnr_sum / metric_frames) : 0.0;
     double avg_rec_ssim = rec_metric_frames ? (rec_ssim_sum / rec_metric_frames) : 0.0;
     double avg_rec_psnr = rec_metric_frames ? (rec_psnr_sum / rec_metric_frames) : 0.0;
+    RunLengthStats frame_mode_raw_stats = compute_run_length_stats(t_frame_flags_raw);
+    RunLengthStats frame_mode_final_stats = compute_run_length_stats(t_frame_flags);
 
     json report;
+    if (!opt.commandline.empty()) {
+        report["commandline"] = opt.commandline;
+    }
+    report["input_ffprobe"] = ffprobe_input_summary_json(opt.source);
+
+    report["encoder_settings"] = {
+        {"use_ffmpeg_encoder", opt.useFfmpegEncoder},
+        {"enc_codec", opt.encCodec},
+        {"enc_crf", opt.encCrf},
+        {"enc_bitrate_mbps", opt.encBitrateMbps},
+        {"enc_maxrate_mbps", opt.encMaxrateMbps},
+        {"enc_bufsize_mbits", opt.encBufsizeMbits},
+        {"enc_gop", opt.encGop},
+        {"enc_bframes", opt.encBFrames},
+        {"enc_scenecut", opt.encNoScenecut ? 0 : 1},
+        {"enc_preset", opt.encPreset},
+        {"enc_tune", opt.encTune},
+        {"enc_profile", opt.encProfile},
+        {"enc_level", opt.encLevel},
+        {"enc_aud", opt.encAud ? 1 : 0},
+        {"enc_repeat_headers", opt.encRepeatHeaders ? 1 : 0}
+    };
+    // Record the exact ffmpeg invocations that produced the MP4s.
+    report["ffmpeg_commands"] = {
+        {"baseline", origWriter.cmd},
+        {"masked", writer.cmd},
+        {"recovered", recWriter.cmd},
+        {"baseline_stderr_log", origWriter.stderrLogPath},
+        {"masked_stderr_log", writer.stderrLogPath},
+        {"recovered_stderr_log", recWriter.stderrLogPath}
+    };
+    report["outputs"] = {
+        {"original_output_mp4", originalOut},
+        {"segmented_output_mp4", stitchedOut},
+        {"recovered_output_mp4", recoveredOut},
+        {"msk1_payloads_bin", seiOutPath},
+        {"dict_dir", opt.dictDir}
+    };
+    if (opt.dumpFrameCache) {
+        report["outputs"]["frame_cache_dir"] = frameCacheDir;
+        report["outputs"]["original_frame_cache_bgr"] = originalFrameCachePath;
+        report["outputs"]["masked_frame_cache_bgr"] = maskedFrameCachePath;
+    }
+    report["metric_definitions"] = {
+        {"rate_codec_sweep_saving_pct", "Computed from whole-file bitrate: (mp4_size_bits/duration) and includes meta_bps from msk1_payloads.bin. See tools/metrics/codec_sweep_analyze.py"},
+        {"rate_per_frame_bytes", "Computed from ffprobe -show_packets packet sizes, aligned by index or pts_time. See tools/metrics/build_per_frame_csv.py and tools/metrics/compare_mp4_packets.py"}
+    };
     report["total_frames"] = frameIdx;
     report["total_detections"] = total_occurrences;
     report["matched_detections"] = matched_occurrences;
@@ -2424,11 +3782,38 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
     report["avg_psnr"] = avg_psnr;
     report["avg_recovered_ssim"] = avg_rec_ssim;
     report["avg_recovered_psnr"] = avg_rec_psnr;
+    report["yolo_matcher"] = yolo_matcher;
+    report["matcher_new_templates"] = matcher_new_templates;
+    report["matcher_id_switches"] = matcher_id_switches;
     report["timing_enabled"] = opt.recordTiming;
-    report["latent_key_enabled"] = opt.yoloLatentKey;
+    report["frame_mode_hysteresis"] = {
+        {"enabled", opt.frameModeHysteresis},
+        {"confirm_frames", opt.frameModeHysteresisConfirmFrames},
+        {"pre_smoothing", {
+            {"switch_count", frame_mode_raw_stats.switchCount},
+            {"fraction_mode_switches", frame_mode_raw_stats.fractionModeSwitches},
+            {"mean_run_length_ref_raw_states", frame_mode_raw_stats.meanRunLength},
+            {"mean_masked_run_length", frame_mode_raw_stats.meanMaskedRunLength},
+            {"mean_raw_run_length", frame_mode_raw_stats.meanRawRunLength},
+            {"max_masked_run_length", frame_mode_raw_stats.maxMaskedRunLength},
+            {"max_raw_run_length", frame_mode_raw_stats.maxRawRunLength}
+        }},
+        {"post_smoothing", {
+            {"switch_count", frame_mode_final_stats.switchCount},
+            {"fraction_mode_switches", frame_mode_final_stats.fractionModeSwitches},
+            {"mean_run_length_ref_raw_states", frame_mode_final_stats.meanRunLength},
+            {"mean_masked_run_length", frame_mode_final_stats.meanMaskedRunLength},
+            {"mean_raw_run_length", frame_mode_final_stats.meanRawRunLength},
+            {"max_masked_run_length", frame_mode_final_stats.maxMaskedRunLength},
+            {"max_raw_run_length", frame_mode_final_stats.maxRawRunLength}
+        }}
+    };
+    report["latent_key_enabled"] = (yolo_matcher == "latent_key");
     report["yolo_heal_only"] = opt.yoloHealOnly;
     report["yolo_heal_skipped_regions"] = yolo_heal_skipped;
-    if (opt.yoloLatentKey) {
+    report["yolo_force_mask_all"] = opt.yoloForceMaskAll;
+    report["yolo_forced_masked_regions"] = yolo_forced_masked;
+    if (yolo_matcher == "latent_key") {
         report["latent_bank_size"] = (uint64_t)latent_bank.size();
         report["latent_cosine_threshold"] = opt.latentCosineThreshold;
         report["latent_sample_period"] = opt.latentSamplePeriod;
@@ -2463,7 +3848,7 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
             };
         }
 
-        // Dump full latent bank (for heatmaps/clustering)
+        // Dump full latent bank (for heatmaps/clustering or for re-use in heal-only runs)
         try {
             json bank = json::array();
             for (const auto &t : latent_bank) {
@@ -2476,12 +3861,19 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                     {"h", t.wh.height},
                     {"use_count", t.use_count},
                     {"path", t.path},
+                    {"minted_frame", t.minted_frame},
+                    {"last_used_frame", t.last_used_frame},
                     {"emb", e}
                 });
             }
-            std::ofstream bf(fs::path(opt.outDir) / "latent_bank.json");
+            fs::path outPath = fs::path(opt.outDir) / "latent_bank.json";
+            // In build-index mode, also write into dictDir so later runs can load from there by default.
+            if (opt.buildIndexOnly) {
+                outPath = fs::path(opt.dictDir) / "latent_bank.json";
+            }
+            std::ofstream bf(outPath);
             bf << bank.dump(2);
-            report["latent_bank_path"] = (fs::path(opt.outDir) / "latent_bank.json").string();
+            report["latent_bank_path"] = outPath.string();
         } catch (...) {
             // ignore
         }
@@ -2543,6 +3935,43 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                 }
             }
         }
+        // Per-frame CSV fields (always emitted)
+        if (i < t_object_present_model.size()) {
+            item["object_present_model"] = t_object_present_model[i];
+            item["object_successfully_masked"] = t_object_successfully_masked[i];
+            item["frame_flags_raw"] = t_frame_flags_raw[i];
+            item["frame_flags"] = t_frame_flags[i];
+        }
+        if (i < t_latent_minted_regions.size()) {
+            item["latent_minted_regions"] = t_latent_minted_regions[i];
+            item["latent_reused_regions"] = t_latent_reused_regions[i];
+            item["masked_bbox_pct"] = t_masked_bbox_pct[i];
+            item["masked_alpha_pct"] = t_masked_alpha_pct[i];
+        }
+        if (i < t_changed_pixels.size()) {
+            item["changed_pixels"] = t_changed_pixels[i];
+            item["changed_pixels_pct"] = t_changed_pixels_pct[i];
+        }
+        if (i < t_preprocess_ms.size()) {
+            item["preprocess_ms"] = t_preprocess_ms[i];
+            item["inference_ms"] = t_inference_ms[i];
+            item["postprocess_ms"] = t_postprocess_ms[i];
+            item["masking_ms"] = t_masking_ms[i];
+            item["encode_baseline_ms"] = t_encode_baseline_ms[i];
+            item["encode_masked_ms"] = t_encode_masked_ms[i];
+            item["stitching_ms"] = t_stitching_ms[i];
+        }
+        // Pixel-mode timing keys (align with requested CSV schema)
+        if (i < t_pixel_roi_ms.size()) {
+            // ROI filter (Kalman), template matching, motion filter (flow)
+            // Note: pixel_kalman_ms is recorded as part of the frame loop (not stored in a dedicated vector),
+            // so we expose it via the derived fields written by the CSV builder using pixel_* timers.
+            item["pixel_bootstrap_ms"] = t_pixel_bootstrap_ms[i];
+            item["pixel_roi_ms"] = t_pixel_roi_ms[i];
+            item["pixel_row_ms"] = t_pixel_row_ms[i];
+            item["pixel_band_ms"] = t_pixel_band_ms[i];
+            item["pixel_flow_ms"] = t_pixel_flow_ms[i];
+        }
         per_frame.push_back(item);
     }
     report["per_frame"] = per_frame;
@@ -2551,9 +3980,9 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
     rf << report.dump(2);
     std::cout << "Saved evaluation report to " << reportPath << std::endl;
 
-    if (writer.isOpened()) writer.release();
-    if (origWriter.isOpened()) origWriter.release();
-    if (recWriter.isOpened()) recWriter.release();
+    writer.close();
+    origWriter.close();
+    recWriter.close();
     cap.release();
 
     return 0;

@@ -19,3 +19,4 @@ huggingface-hub
 safetensors
 numpy
 supervision
+matplotlib

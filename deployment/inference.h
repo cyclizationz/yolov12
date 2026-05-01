@@ -64,6 +64,14 @@ public:
     char* WarmUpSession();
     
     char* PreProcess(cv::Mat& iImg, std::vector<int> iImgSize, cv::Mat& oImg);
+
+    // Per-call timing breakdown (milliseconds) for the most recent RunSession().
+    // - preprocess: colorspace + letterbox resize/pad + blob creation
+    // - infer: onnxruntime session->Run
+    // - postprocess: decode outputs + NMS + mask decode
+    double LastPreprocessMs() const { return last_preprocess_ms; }
+    double LastInferMs() const { return last_infer_ms; }
+    double LastPostprocessMs() const { return last_postprocess_ms; }
     
     std::vector<std::string> classes{};
 
@@ -89,4 +97,9 @@ private:
     // Padding values for coordinate mapping
     int padW = 0;
     int padH = 0;
+
+    // Timing (ms) for last RunSession().
+    double last_preprocess_ms = 0.0;
+    double last_infer_ms = 0.0;
+    double last_postprocess_ms = 0.0;
 };
