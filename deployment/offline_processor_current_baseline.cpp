@@ -278,6 +278,20 @@ static cv::Mat get_pixel_template_rgba_for_detection(const DL_RESULT &d) {
     return rgba;
 }
 
+static cv::Rect expand_pixel_mask_box(const cv::Rect &box, int pad_px, const cv::Size &frame_size) {
+    if (frame_size.width <= 0 || frame_size.height <= 0) return cv::Rect();
+    const cv::Rect bounds(0, 0, frame_size.width, frame_size.height);
+    const cv::Rect clamped = box & bounds;
+    if (clamped.area() <= 0) return cv::Rect();
+    if (pad_px <= 0) return clamped;
+
+    const int x0 = std::max(0, clamped.x - pad_px);
+    const int y0 = std::max(0, clamped.y - pad_px);
+    const int x1 = std::min(frame_size.width, clamped.x + clamped.width + pad_px);
+    const int y1 = std::min(frame_size.height, clamped.y + clamped.height + pad_px);
+    return cv::Rect(x0, y0, std::max(0, x1 - x0), std::max(0, y1 - y0));
+}
+
 static cv::Vec3b kind_color_from_kind_id(int kindId) {
     if (kindId >= 0 && kindId < static_cast<int>(g_pixel_kind_id_to_color_bgr.size())) {
         return g_pixel_kind_id_to_color_bgr[kindId];
@@ -2493,7 +2507,8 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                             const auto &tmpl = g_pixel_templates[(size_t)ti];
                             DL_RESULT d{};
                             d.confidence = 1.0f;
-                            d.box = r;
+                            d.box = expand_pixel_mask_box(r, opt.pixelMaskPadPx, frame.size());
+                            if (d.box.area() <= 0) continue;
                             d.boxMask = cv::Mat::zeros(frame.size(), CV_8UC1);
                             cv::rectangle(d.boxMask, d.box, cv::Scalar(255), cv::FILLED);
                             d.classId = tmpl.kindId;
@@ -2531,7 +2546,8 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                                 const auto &tmpl = g_pixel_templates[(size_t)ti];
                                 DL_RESULT d{};
                                 d.confidence = 1.0f;
-                                d.box = r;
+                                d.box = expand_pixel_mask_box(r, opt.pixelMaskPadPx, frame.size());
+                                if (d.box.area() <= 0) continue;
                                 d.boxMask = cv::Mat::zeros(frame.size(), CV_8UC1);
                                 cv::rectangle(d.boxMask, d.box, cv::Scalar(255), cv::FILLED);
                                 d.classId = tmpl.kindId;

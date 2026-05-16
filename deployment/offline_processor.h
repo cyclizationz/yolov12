@@ -49,6 +49,7 @@ struct OfflineOptions {
     // - "rgb:R,G,B": constant color specified in RGB (0-255 each)
     std::string maskColor = "green";
     int maskColorPeriod = 200; // only used when maskColor == "dominant"
+    int maskColorLocalPadPx = 0; // if >0, sample dominant color near detected boxes only
     int maskColorR = 0, maskColorG = 255, maskColorB = 0; // used for rgb: and named constants
     bool recordTiming = false; // Record per-frame timing stats into report.json (no extra printing)
     bool yoloLatentKey = false; // YOLO offline simulator: assign template_id via maskCoeff embedding, no hashing on client
@@ -136,6 +137,7 @@ struct OfflineOptions {
     bool encNoScenecut = true;       // scenecut=0
     bool encRepeatHeaders = true;    // repeat_headers=1
     bool encAud = true;              // aud=1 (helps parsers)
+    bool encOpenGopDefaults = false; // leave codec keyint/scenecut defaults open
 
     // Encoder codec (ffmpeg -c:v). Default keeps existing behavior.
     // Examples: libx264, libx265, libsvtav1, libaom-av1
@@ -155,6 +157,8 @@ struct OfflineOptions {
     float fillBgEmaAlpha = 0.98f;    // EMA alpha for bg_ema (closer to 1 => slower adaptation)
     int fillInpaintRadius = 5;       // inpaint radius (pixels)
     std::string fillInpaintMethod = "telea"; // telea|ns
+    bool maskColorLocalPerRegion = false; // dominant color: compute one flat color per detected region
+    std::string maskColorLocalStat = "mode"; // mode|median|average
 
     // Pixel mode tracking (Kalman + ROI template matching)
     int pixelBootstrapInterval = 30; // frames between global re-bootstrap
@@ -190,6 +194,10 @@ struct OfflineOptions {
     float pixelForceScale = 0.0f;
     // Optional safety cap for pixel-template loading. 0 disables the cap.
     int pixelMaxTemplates = 0;
+    int pixelMaskPadPx = 0;          // expand emitted pixel-mode mask/recovery boxes by this many px
+    bool pixelGridHeader = false;    // encode repeated pixel templates as MSK1 v5 grid row-runs
+    int pixelGridSnapTolPx = 12;     // max bbox-to-grid snap error for grouping
+    int pixelGridMinRun = 2;         // minimum consecutive cells to prefer grid metadata over regions
 };
 
 struct DictItem {

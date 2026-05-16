@@ -48,6 +48,10 @@ void print_usage(const char* program_name) {
               << "  --pixel-thr-hi <f>      Pixel: adaptive threshold clamp high (default: 0.65)\n"
               << "  --pixel-force-scale <f> Pixel: force template scale (0=auto, 1.0=native size)\n"
               << "  --pixel-max-templates <n> Pixel: cap loaded templates to limit memory (0=unlimited, default: 0)\n"
+              << "  --pixel-mask-pad <px>   Pixel: expand emitted mask/recovery boxes by this many px (default: 0)\n"
+              << "  --pixel-grid-header     Pixel: encode repeated templates as compact grid row-runs (MSK1 v5)\n"
+              << "  --pixel-grid-snap <px>  Pixel grid: max snap error in px (default: 12)\n"
+              << "  --pixel-grid-min-run <n> Pixel grid: min consecutive cells per row-run (default: 2)\n"
               << "  --yolo-class-color      YOLO mode: paint masks with class-consistent colors (instead of hash colors)\n"
               << "  --timing                Record per-frame timing stats into report.json\n"
               << "  --yolo-matcher <s>      YOLO matcher: latent_key|phash|iou_only|rgb_hist (default: phash unless --latent-key)\n"
@@ -81,16 +85,20 @@ void print_usage(const char* program_name) {
               << "  --enc-bufsize-mbits <f> Encoder VBV bufsize in Mbits (defaults to 2x maxrate)\n"
               << "  --enc-preset <s>        Encoder preset (default: superfast)\n"
               << "  --enc-tune <s>          Encoder tune (default: zerolatency)\n"
-              << "  --enc-profile <s>       Encoder profile (default: baseline)\n"
-              << "  --enc-level <s>         Encoder level (default: 4.2)\n"
+              << "  --enc-profile <s>       Encoder profile, or none to leave default (default: baseline)\n"
+              << "  --enc-level <s>         Encoder level, or none to leave default (default: 4.2)\n"
               << "  --enc-scenecut <0|1>    Encoder scenecut (default: 0)\n"
               << "  --enc-aud <0|1>         Encoder access unit delimiters (default: 1)\n"
               << "  --enc-repeat-headers <0|1> Encoder repeat_headers (default: 1)\n"
+              << "  --enc-open-gop-defaults Leave codec keyint/scenecut defaults open (experimental)\n"
               << "  --enc-codec <s>         Encoder codec (ffmpeg -c:v), e.g. libx264|libx265|libsvtav1|libaom-av1 (default: libx264)\n"
               << "  --no-ffmpeg-enc         Use OpenCV VideoWriter instead of FFmpeg pipe encoder\n"
               << "  --yolo-force-mask-all   YOLO debug: paint every segmentation mask (upper-bound bitrate test; breaks recovery)\n"
               << "  --mask-color <s>        Mask paint color: green|black|brown|class|dominant|rgb:R,G,B (default: green)\n"
               << "  --mask-color-period <n> Recompute dominant color every N frames (default: 200; only for mask-color=dominant)\n"
+              << "  --mask-color-local-pad <n> Dominant color: sample expanded bbox neighborhoods instead of whole frame (px, default: 0)\n"
+              << "  --mask-color-local-per-region Dominant color: choose one flat local color per detected region\n"
+              << "  --mask-color-local-stat <s> Dominant local statistic: mode|median|average (default: mode)\n"
               << "  --fill-mode <s>         Fill mode: solid|blur|bg_ema|inpaint (default: solid)\n"
               << "  --feather-px <n>        Feather band (px): blend fill->original across boundary, 0 disables (default: 0)\n"
               << "  --fill-blur-sigma <f>   Blur sigma (px) for fill-mode=blur (default: 8.0)\n"
@@ -130,6 +138,10 @@ int main(int argc, char* argv[]) {
         OPT_PIXEL_THR_HI = 1005,
         OPT_PIXEL_FORCE_SCALE = 1100,
         OPT_PIXEL_MAX_TEMPLATES = 1101,
+        OPT_PIXEL_MASK_PAD = 1102,
+        OPT_PIXEL_GRID_HEADER = 1103,
+        OPT_PIXEL_GRID_SNAP = 1104,
+        OPT_PIXEL_GRID_MIN_RUN = 1105,
         OPT_YOLO_FORCE_MASK_ALL = 1006,
         OPT_YOLO_HEAL_FALLBACK_WINDOW = 1007,
         OPT_YOLO_HEAL_FALLBACK_MINSIM = 1008,
@@ -164,7 +176,11 @@ int main(int argc, char* argv[]) {
         OPT_FILL_INPAINT_RADIUS = 1034,
         OPT_FILL_INPAINT_METHOD = 1035,
         OPT_DUMP_FRAME_CACHE = 1039,
-        OPT_YOLO_MATCHER = 1043
+        OPT_YOLO_MATCHER = 1043,
+        OPT_ENC_OPEN_GOP_DEFAULTS = 1044,
+        OPT_MASK_COLOR_LOCAL_PAD = 1045,
+        OPT_MASK_COLOR_LOCAL_PER_REGION = 1046,
+        OPT_MASK_COLOR_LOCAL_STAT = 1047
         ,OPT_FRAME_HYSTERESIS = 1041
         ,OPT_FRAME_HYSTERESIS_CONFIRM = 1042
     };
@@ -194,6 +210,10 @@ int main(int argc, char* argv[]) {
         {"pixel-thr-hi", required_argument, 0, OPT_PIXEL_THR_HI},
         {"pixel-force-scale", required_argument, 0, OPT_PIXEL_FORCE_SCALE},
         {"pixel-max-templates", required_argument, 0, OPT_PIXEL_MAX_TEMPLATES},
+        {"pixel-mask-pad", required_argument, 0, OPT_PIXEL_MASK_PAD},
+        {"pixel-grid-header", no_argument, 0, OPT_PIXEL_GRID_HEADER},
+        {"pixel-grid-snap", required_argument, 0, OPT_PIXEL_GRID_SNAP},
+        {"pixel-grid-min-run", required_argument, 0, OPT_PIXEL_GRID_MIN_RUN},
         {"latent-key", no_argument, 0, 'L'},
         {"latent-thr", required_argument, 0, 'Z'},
         {"latent-period", required_argument, 0, 'P'},
@@ -229,11 +249,15 @@ int main(int argc, char* argv[]) {
         {"enc-scenecut", required_argument, 0, OPT_ENC_SCENECUT},
         {"enc-aud", required_argument, 0, OPT_ENC_AUD},
         {"enc-repeat-headers", required_argument, 0, OPT_ENC_REPEAT_HEADERS},
+        {"enc-open-gop-defaults", no_argument, 0, OPT_ENC_OPEN_GOP_DEFAULTS},
         {"enc-codec", required_argument, 0, OPT_ENC_CODEC},
         {"no-ffmpeg-enc", no_argument, 0, OPT_NO_FFMPEG_ENC},
         {"yolo-force-mask-all", no_argument, 0, OPT_YOLO_FORCE_MASK_ALL},
         {"mask-color", required_argument, 0, OPT_MASK_COLOR},
         {"mask-color-period", required_argument, 0, OPT_MASK_COLOR_PERIOD},
+        {"mask-color-local-pad", required_argument, 0, OPT_MASK_COLOR_LOCAL_PAD},
+        {"mask-color-local-per-region", no_argument, 0, OPT_MASK_COLOR_LOCAL_PER_REGION},
+        {"mask-color-local-stat", required_argument, 0, OPT_MASK_COLOR_LOCAL_STAT},
         {"fill-mode", required_argument, 0, OPT_FILL_MODE},
         {"feather-px", required_argument, 0, OPT_FEATHER_PX},
         {"fill-blur-sigma", required_argument, 0, OPT_FILL_BLUR_SIGMA},
@@ -341,6 +365,18 @@ int main(int argc, char* argv[]) {
                 break;
             case OPT_PIXEL_MAX_TEMPLATES:
                 opt.pixelMaxTemplates = std::max(0, std::stoi(optarg));
+                break;
+            case OPT_PIXEL_MASK_PAD:
+                opt.pixelMaskPadPx = std::max(0, std::stoi(optarg));
+                break;
+            case OPT_PIXEL_GRID_HEADER:
+                opt.pixelGridHeader = true;
+                break;
+            case OPT_PIXEL_GRID_SNAP:
+                opt.pixelGridSnapTolPx = std::max(0, std::stoi(optarg));
+                break;
+            case OPT_PIXEL_GRID_MIN_RUN:
+                opt.pixelGridMinRun = std::max(1, std::stoi(optarg));
                 break;
             case 'Y':
                 opt.yoloClassConsistentColor = true;
@@ -457,6 +493,9 @@ int main(int argc, char* argv[]) {
             case OPT_ENC_REPEAT_HEADERS:
                 opt.encRepeatHeaders = (std::stoi(optarg) != 0);
                 break;
+            case OPT_ENC_OPEN_GOP_DEFAULTS:
+                opt.encOpenGopDefaults = true;
+                break;
             case OPT_NO_FFMPEG_ENC:
                 opt.useFfmpegEncoder = false;
                 break;
@@ -500,6 +539,18 @@ int main(int argc, char* argv[]) {
             case OPT_MASK_COLOR_PERIOD:
                 opt.maskColorPeriod = std::max(1, std::stoi(optarg));
                 break;
+            case OPT_MASK_COLOR_LOCAL_PAD:
+                opt.maskColorLocalPadPx = std::max(0, std::stoi(optarg));
+                break;
+            case OPT_MASK_COLOR_LOCAL_PER_REGION:
+                opt.maskColorLocalPerRegion = true;
+                break;
+            case OPT_MASK_COLOR_LOCAL_STAT: {
+                std::string v = optarg ? std::string(optarg) : std::string("mode");
+                for (auto &ch : v) ch = (char)std::tolower((unsigned char)ch);
+                opt.maskColorLocalStat = (v == "median" || v == "average") ? v : "mode";
+                break;
+            }
             case OPT_ENC_CODEC:
                 opt.encCodec = optarg ? std::string(optarg) : std::string("libx264");
                 break;

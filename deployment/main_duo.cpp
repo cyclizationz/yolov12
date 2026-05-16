@@ -49,6 +49,7 @@ static void print_usage(const char *program_name) {
               << "  --pixel-thr-lo <f>      Pixel: adaptive threshold clamp low (default: 0.30)\n"
               << "  --pixel-thr-hi <f>      Pixel: adaptive threshold clamp high (default: 0.65)\n"
               << "  --pixel-force-scale <f> Pixel: force template scale (0=auto, 1.0=native size)\n"
+              << "  --pixel-mask-pad <px>   Pixel: expand emitted mask/recovery boxes by this many px (default: 0)\n"
               << "  --yolo-class-color      YOLO mode: paint masks with class-consistent colors (instead of hash colors)\n"
               << "  --timing                Record per-frame timing stats into report.json\n"
               << "  --latent-key            YOLO offline sim: assign template_id by maskCoeff embedding (no client hashing)\n"
@@ -160,7 +161,8 @@ int main(int argc, char *argv[]) {
         OPT_FILL_INPAINT_RADIUS = 1034,
         OPT_FILL_INPAINT_METHOD = 1035,
         OPT_DUMP_FRAME_CACHE = 1039,
-        OPT_PIXEL_FORCE_SCALE = 1100
+        OPT_PIXEL_FORCE_SCALE = 1100,
+        OPT_PIXEL_MASK_PAD = 1102
     };
 
     static struct option long_options[] = {
@@ -187,6 +189,7 @@ int main(int argc, char *argv[]) {
         {"pixel-thr-lo", required_argument, 0, OPT_PIXEL_THR_LO},
         {"pixel-thr-hi", required_argument, 0, OPT_PIXEL_THR_HI},
         {"pixel-force-scale", required_argument, 0, OPT_PIXEL_FORCE_SCALE},
+        {"pixel-mask-pad", required_argument, 0, OPT_PIXEL_MASK_PAD},
         {"latent-key", no_argument, 0, 'L'},
         {"latent-thr", required_argument, 0, 'Z'},
         {"latent-period", required_argument, 0, 'P'},
@@ -271,6 +274,7 @@ int main(int argc, char *argv[]) {
             case OPT_PIXEL_THR_LO: opt.pixelThrLo = std::stof(optarg); break;
             case OPT_PIXEL_THR_HI: opt.pixelThrHi = std::stof(optarg); break;
             case OPT_PIXEL_FORCE_SCALE: opt.pixelForceScale = std::max(0.0f, std::stof(optarg)); break;
+            case OPT_PIXEL_MASK_PAD: opt.pixelMaskPadPx = std::max(0, std::stoi(optarg)); break;
             case 'Y': opt.yoloClassConsistentColor = true; break;
             case 'R': opt.recordTiming = true; break;
             case 'L': opt.yoloLatentKey = true; break;

@@ -226,7 +226,7 @@ def write_protocol_note(
             "- Rate control: fixed target bitrate sweep at `8/12/16/20/24 Mbps` with matched `maxrate` and `bufsize=2x bitrate`",
             "- Encoder defaults: `libx264`, `superfast`, `gop=60`, `scenecut=0`, `tune=none`, `aud=1`, `repeat-headers=1`",
             "- Current FC5 Exp1 setting is an upper-bound non-heal mode: latent-key masking without `--yolo-heal-only`",
-            "- Mario pixel mode uses native template scale and widened band scan: `pixel-force-scale=1.0`, `pixel-band-pad-y=80`, `pixel-bands=4`, `pixel-max-peaks=60`",
+            "- Mario pixel mode uses native template scale, 2px mask padding, compact grid headers, and widened band scan: `pixel-force-scale=1.0`, `pixel-mask-pad=2`, `pixel-grid-header`, `pixel-grid-snap=12`, `pixel-band-pad-y=80`, `pixel-bands=4`, `pixel-max-peaks=60`",
             "- RESPAWN quality is measured on `recovered_output.mp4` against the normalized input clip",
             "- Achieved bitrate is measured from `segmented_output.mp4` plus `msk1_payloads.bin` sidecar bitrate",
             "- BD-rate is averaged per clip first, then averaged across clips in the same game",
@@ -624,6 +624,11 @@ def common_variant_args(clip: Any) -> list[str]:
             str(PIXEL_TEMPLATES),
             "--pixel-force-scale",
             "1.0",
+            "--pixel-mask-pad",
+            "2",
+            "--pixel-grid-header",
+            "--pixel-grid-snap",
+            "12",
             "--pixel-band-pad-y",
             "80",
             "--pixel-bands",
@@ -715,6 +720,7 @@ def run_variant(
     report_only: bool,
     model: Path,
     bitrate: float,
+    enc_gop: int,
     extra_args: list[str],
     common_args: list[str],
     use_cuda: bool,
@@ -743,7 +749,7 @@ def run_variant(
         "--enc-bufsize-mbits",
         str(2.0 * bitrate),
         "--enc-gop",
-        "60",
+        str(enc_gop),
         "--enc-preset",
         "superfast",
         "--enc-tune",
@@ -775,6 +781,7 @@ def run_pure_streaming_variant(
     video_backup_root: Path | None,
     report_only: bool,
     bitrate: float,
+    enc_gop: int,
 ) -> None:
     if variant_run_complete(out_dir, suite_out_dir=suite_out_dir, video_backup_root=video_backup_root):
         print(f"[SKIP] pure_streaming already complete: {out_dir}", flush=True)
@@ -798,7 +805,7 @@ def run_pure_streaming_variant(
             "--enc-bufsize-mbits",
             str(2.0 * bitrate),
             "--enc-gop",
-            "60",
+            str(enc_gop),
             "--enc-preset",
             "superfast",
             "--enc-tune",
@@ -829,6 +836,7 @@ def evaluate_variant(
     suite_out_dir: Path,
     video_backup_root: Path | None,
     threads: int,
+    skip_video_metrics: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], float, float] | None:
     report_path = run_dir / "report.json"
     if not report_path.exists():
@@ -841,8 +849,12 @@ def evaluate_variant(
     recovered_video = resolve_video_in_run_or_backup(run_dir, "recovered_output.mp4", suite_out_dir=suite_out_dir, video_backup_root=video_backup_root)
     if base_video is None or masked_video is None or recovered_video is None:
         return None
-    delivered_metrics = compute_video_metrics(ref_video=ref_video, dist_video=recovered_video, msk1_bin=msk1_path, threads=threads, scale_height=1080)
-    stitch_metrics = compute_video_metrics(ref_video=base_video, dist_video=recovered_video, msk1_bin=msk1_path, threads=threads, scale_height=1080)
+    if skip_video_metrics:
+        delivered_metrics = {}
+        stitch_metrics = {}
+    else:
+        delivered_metrics = compute_video_metrics(ref_video=ref_video, dist_video=recovered_video, msk1_bin=msk1_path, threads=threads, scale_height=1080)
+        stitch_metrics = compute_video_metrics(ref_video=base_video, dist_video=recovered_video, msk1_bin=msk1_path, threads=threads, scale_height=1080)
     duration = ffprobe_duration_s(masked_video)
     video_bps = bitrate_bps(masked_video)
     meta_bps = ((msk1_path.stat().st_size * 8.0) / duration) if msk1_path.exists() and duration > 1e-9 else 0.0
@@ -949,6 +961,7 @@ def main() -> None:
     ap.add_argument("--manifest", type=Path, default=RESPAWN2026_DIR / "manifest" / "offline_manifest.json")
     ap.add_argument("--out-dir", type=Path, default=RESPAWN2026_DIR / "exp1")
     ap.add_argument("--bitrate-mbps", nargs="+", type=float, default=[8.0, 12.0, 16.0, 20.0, 24.0])
+    ap.add_argument("--enc-gop", type=int, default=60, help="Encoder keyint/GOP size. Default matches the Exp1 protocol.")
     ap.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     ap.add_argument(
         "--threads",
@@ -972,6 +985,11 @@ def main() -> None:
         "--report-only",
         action="store_true",
         help="Do not run the offline binary or build_per_frame_csv; only aggregate metrics from existing outputs.",
+    )
+    ap.add_argument(
+        "--skip-video-metrics",
+        action="store_true",
+        help="Skip VMAF/SSIM/PSNR computation and only aggregate bitrate/sidecar/report fields.",
     )
     ap.add_argument(
         "--no-cuda",
@@ -1060,6 +1078,7 @@ def main() -> None:
                         report_only=args.report_only,
                         model=model,
                         bitrate=bitrate,
+                        enc_gop=args.enc_gop,
                         extra_args=list(args.baseline_extra_args),
                         common_args=common_args,
                         use_cuda=not args.no_cuda,
@@ -1072,6 +1091,7 @@ def main() -> None:
                         video_backup_root=video_backup_root,
                         report_only=args.report_only,
                         bitrate=bitrate,
+                        enc_gop=args.enc_gop,
                     )
                 run_variant(
                     bin_path=OFFLINE_BIN,
@@ -1083,6 +1103,7 @@ def main() -> None:
                     report_only=args.report_only,
                     model=model,
                     bitrate=bitrate,
+                    enc_gop=args.enc_gop,
                     extra_args=list(args.respawn_extra_args),
                     common_args=common_args,
                     use_cuda=not args.no_cuda,
@@ -1090,11 +1111,11 @@ def main() -> None:
 
                 print(f"[RD]   {clip.clip_id} @ {rate_tag} — compute metrics {ref_variant} …", flush=True)
                 ref_eval = evaluate_variant(
-                    ref_video, ref_dir, args.out_dir, video_backup_root, args.threads
+                    ref_video, ref_dir, args.out_dir, video_backup_root, args.threads, args.skip_video_metrics
                 )
                 print(f"[RD]   {clip.clip_id} @ {rate_tag} — compute metrics respawn …", flush=True)
                 respawn_eval = evaluate_variant(
-                    ref_video, respawn_dir, args.out_dir, video_backup_root, args.threads
+                    ref_video, respawn_dir, args.out_dir, video_backup_root, args.threads, args.skip_video_metrics
                 )
                 print(f"[RD]   {clip.clip_id} @ {rate_tag} — metrics done", flush=True)
 

@@ -8,7 +8,7 @@ This file records the exact Experiment 1 protocol used by `run_rd_suite.py`.
 - Rate control: fixed target bitrate sweep at `8/12/16/20/24 Mbps` with matched `maxrate` and `bufsize=2x bitrate`
 - Encoder defaults: `libx264`, `superfast`, `gop=60`, `scenecut=0`, `tune=none`, `aud=1`, `repeat-headers=1`
 - Current FC5 Exp1 setting is an upper-bound non-heal mode: latent-key masking without `--yolo-heal-only`
-- Mario pixel mode uses native template scale and widened band scan: `pixel-force-scale=1.0`, `pixel-band-pad-y=80`, `pixel-bands=4`, `pixel-max-peaks=60`
+- Mario pixel mode uses native template scale, 2px mask padding, compact grid headers, and widened band scan: `pixel-force-scale=1.0`, `pixel-mask-pad=2`, `pixel-grid-header`, `pixel-grid-snap=12`, `pixel-band-pad-y=80`, `pixel-bands=4`, `pixel-max-peaks=60`
 - RESPAWN quality is measured on `recovered_output.mp4` against the normalized input clip
 - Achieved bitrate is measured from `segmented_output.mp4` plus `msk1_payloads.bin` sidecar bitrate
 - BD-rate is averaged per clip first, then averaged across clips in the same game

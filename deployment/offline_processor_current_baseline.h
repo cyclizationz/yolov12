@@ -176,6 +176,7 @@ struct OfflineOptions {
     // - 0.0 (default): auto-calibrate per template from the first frame (may choose !=1.0)
     // - >0: force a fixed scale for all templates (e.g., 1.0 uses native template size)
     float pixelForceScale = 0.0f;
+    int pixelMaskPadPx = 0;          // expand emitted pixel-mode mask/recovery boxes by this many px
 };
 
 struct DictItem {

@@ -94,6 +94,11 @@ def main() -> None:
     ap.add_argument("--enc-scenecut", type=int, default=0)
     ap.add_argument("--enc-aud", type=int, default=1)
     ap.add_argument("--enc-repeat-headers", type=int, default=1)
+    ap.add_argument(
+        "--enc-open-gop-defaults",
+        action="store_true",
+        help="Omit fixed keyint/min-keyint/scenecut in -x264-params (match offline --enc-open-gop-defaults).",
+    )
     args = ap.parse_args()
 
     br = float(args.bitrate_mbps)
@@ -104,11 +109,17 @@ def main() -> None:
     ensure_dir(out_dir)
     orig = out_dir / "original_output.mp4"
 
-    x264 = (
-        f"keyint={int(args.enc_gop)}:min-keyint={int(args.enc_gop)}:"
-        f"bframes=0:scenecut={int(args.enc_scenecut)}:"
-        f"repeat-headers={int(args.enc_repeat_headers)}:aud={int(args.enc_aud)}"
-    )
+    if args.enc_open_gop_defaults:
+        x264 = (
+            f"bframes=0:"
+            f"repeat-headers={int(args.enc_repeat_headers)}:aud={int(args.enc_aud)}"
+        )
+    else:
+        x264 = (
+            f"keyint={int(args.enc_gop)}:min-keyint={int(args.enc_gop)}:"
+            f"bframes=0:scenecut={int(args.enc_scenecut)}:"
+            f"repeat-headers={int(args.enc_repeat_headers)}:aud={int(args.enc_aud)}"
+        )
     cmd: list[str] = [
         "ffmpeg",
         "-y",
@@ -170,6 +181,7 @@ def main() -> None:
             "enc_preset": args.enc_preset,
             "enc_tune": args.enc_tune,
             "enc_scenecut": int(args.enc_scenecut),
+            "enc_open_gop_defaults": bool(args.enc_open_gop_defaults),
             "enc_codec": "libx264",
         },
         "per_frame": per_frame,

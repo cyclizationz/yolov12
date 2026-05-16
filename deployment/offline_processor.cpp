@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <sstream>
 #include <csignal>
+#include <climits>
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -347,6 +348,20 @@ static cv::Mat get_pixel_template_rgba_for_detection(const DL_RESULT &d) {
     cv::Mat rgba;
     cv::cvtColor(bgr_rs, rgba, cv::COLOR_BGR2BGRA);
     return rgba;
+}
+
+static cv::Rect expand_pixel_mask_box(const cv::Rect &box, int pad_px, const cv::Size &frame_size) {
+    if (frame_size.width <= 0 || frame_size.height <= 0) return cv::Rect();
+    const cv::Rect bounds(0, 0, frame_size.width, frame_size.height);
+    const cv::Rect clamped = box & bounds;
+    if (clamped.area() <= 0) return cv::Rect();
+    if (pad_px <= 0) return clamped;
+
+    const int x0 = std::max(0, clamped.x - pad_px);
+    const int y0 = std::max(0, clamped.y - pad_px);
+    const int x1 = std::min(frame_size.width, clamped.x + clamped.width + pad_px);
+    const int y1 = std::min(frame_size.height, clamped.y + clamped.height + pad_px);
+    return cv::Rect(x0, y0, std::max(0, x1 - x0), std::max(0, y1 - y0));
 }
 
 static cv::Vec3b kind_color_from_kind_id(int kindId) {
@@ -1816,6 +1831,214 @@ static cv::Vec3b choose_mask_color_bgr(const OfflineOptions &opt, int classId, c
     return cv::Vec3b(0, 255, 0);
 }
 
+struct PixelGridRuntimeGroup {
+    PixelGridGroup meta;
+    std::vector<cv::Rect> cellBoxes;
+};
+
+static cv::Size pixel_template_size_for_path(const std::string &path, const cv::Size &fallback) {
+    auto it = g_pixel_relpath_to_index.find(path);
+    if (it == g_pixel_relpath_to_index.end()) return fallback;
+    int idx = it->second;
+    if (idx < 0 || idx >= static_cast<int>(g_pixel_templates.size())) return fallback;
+    const auto &tmpl = g_pixel_templates[(size_t)idx];
+    if (tmpl.bgr.empty()) return fallback;
+    return tmpl.bgr.size();
+}
+
+static cv::Mat get_pixel_template_rgba_by_path(const std::string &path) {
+    auto it = g_pixel_relpath_to_index.find(path);
+    if (it == g_pixel_relpath_to_index.end()) return cv::Mat();
+    int idx = it->second;
+    if (idx < 0 || idx >= static_cast<int>(g_pixel_templates.size())) return cv::Mat();
+    const auto &tmpl = g_pixel_templates[(size_t)idx];
+    if (tmpl.bgr.empty()) return cv::Mat();
+    cv::Mat rgba;
+    cv::cvtColor(tmpl.bgr, rgba, cv::COLOR_BGR2BGRA);
+    return rgba;
+}
+
+static void paint_pixel_rect_color(cv::Mat &dst_bgr,
+                                   cv::Mat &mask_union_u8,
+                                   const cv::Rect &rect,
+                                   const cv::Vec3b &color,
+                                   float alpha) {
+    if (dst_bgr.empty()) return;
+    cv::Rect safe = rect & cv::Rect(0, 0, dst_bgr.cols, dst_bgr.rows);
+    if (safe.area() <= 0) return;
+    if (!mask_union_u8.empty()) {
+        cv::rectangle(mask_union_u8, safe, cv::Scalar(255), cv::FILLED);
+    }
+    alpha = std::max(0.0f, std::min(1.0f, alpha));
+    const bool solid = (alpha >= 0.999f);
+    for (int y = safe.y; y < safe.y + safe.height; ++y) {
+        cv::Vec3b *row = dst_bgr.ptr<cv::Vec3b>(y);
+        for (int x = safe.x; x < safe.x + safe.width; ++x) {
+            cv::Vec3b &px = row[x];
+            if (solid) {
+                px = color;
+            } else {
+                for (int c = 0; c < 3; ++c) {
+                    float v = (1.0f - alpha) * (float)px[c] + alpha * (float)color[c];
+                    px[c] = (uchar)std::max(0, std::min(255, (int)std::lround(v)));
+                }
+            }
+        }
+    }
+}
+
+static int build_pixel_grid_groups_and_paint(const std::vector<DL_RESULT> &dets,
+                                             const OfflineOptions &opt,
+                                             const cv::Size &frameSize,
+                                             const cv::Vec3b &dominant_bgr,
+                                             cv::Mat &processed,
+                                             cv::Mat &mask_union_u8,
+                                             std::vector<SEIRegion> &legacy_regions,
+                                             std::vector<PixelGridGroup> &grid_groups,
+                                             std::vector<PixelGridRuntimeGroup> &runtime_groups) {
+    struct Snap {
+        size_t idx{0};
+        int row{0};
+        int col{0};
+        cv::Rect box;
+    };
+
+    std::unordered_map<std::string, std::vector<size_t>> byPath;
+    byPath.reserve(dets.size());
+    for (size_t i = 0; i < dets.size(); ++i) {
+        const auto &d = dets[i];
+        if (d.confidence < opt.confThreshold || d.box.area() <= 0 || d.seiPath.empty()) continue;
+        byPath[d.seiPath].push_back(i);
+    }
+
+    std::vector<uint8_t> grouped(dets.size(), 0);
+    int refCells = 0;
+    const cv::Rect bounds(0, 0, frameSize.width, frameSize.height);
+    const int minRun = std::max(1, opt.pixelGridMinRun);
+    const int snapTol = std::max(0, opt.pixelGridSnapTolPx);
+
+    for (auto &kv : byPath) {
+        const std::string &path = kv.first;
+        auto &idxs = kv.second;
+        if (idxs.empty()) continue;
+        std::sort(idxs.begin(), idxs.end(), [&](size_t a, size_t b) {
+            const cv::Rect &ra = dets[a].box;
+            const cv::Rect &rb = dets[b].box;
+            if (ra.y != rb.y) return ra.y < rb.y;
+            return ra.x < rb.x;
+        });
+
+        cv::Size tileSize = pixel_template_size_for_path(path, dets[idxs.front()].box.size());
+        if (tileSize.width <= 0 || tileSize.height <= 0 ||
+            tileSize.width > 65535 || tileSize.height > 65535) {
+            continue;
+        }
+
+        std::unordered_map<int, std::vector<Snap>> snapsByRow;
+        std::vector<int> rowReps;
+        for (size_t idx : idxs) {
+            const cv::Rect box = dets[idx].box & bounds;
+            if (box.area() <= 0) continue;
+            int rowY = box.y;
+            bool rowMatched = false;
+            for (int &rep : rowReps) {
+                if (std::abs(box.y - rep) <= snapTol) {
+                    rowY = rep;
+                    rowMatched = true;
+                    break;
+                }
+            }
+            if (!rowMatched) rowReps.push_back(rowY);
+            snapsByRow[rowY].push_back(Snap{idx, 0, 0, cv::Rect(box.x, rowY, tileSize.width, tileSize.height) & bounds});
+        }
+        if (snapsByRow.empty()) continue;
+        std::vector<int> rowKeys = rowReps;
+        std::sort(rowKeys.begin(), rowKeys.end());
+
+        int classId = dets[idxs.front()].classId;
+        for (int rowY : rowKeys) {
+            auto &rowSnaps = snapsByRow[rowY];
+            std::sort(rowSnaps.begin(), rowSnaps.end(), [](const Snap &a, const Snap &b) {
+                return a.box.x < b.box.x;
+            });
+            for (size_t i = 0; i < rowSnaps.size();) {
+                size_t j = i + 1;
+                while (j < rowSnaps.size() &&
+                       std::abs(rowSnaps[j].box.x - (rowSnaps[j - 1].box.x + tileSize.width)) <= snapTol) {
+                    ++j;
+                }
+                int len = (int)(j - i);
+                if (len >= minRun && len <= 65535) {
+                    const int originX = rowSnaps[i].box.x;
+                    const int originY = rowY;
+                    PixelGridRuntimeGroup runtime{};
+                    runtime.meta.id = (uint32_t)grid_groups.size();
+                    runtime.meta.origin_x = (uint32_t)std::max(0, originX);
+                    runtime.meta.origin_y = (uint32_t)std::max(0, originY);
+                    runtime.meta.tile_w = (uint16_t)tileSize.width;
+                    runtime.meta.tile_h = (uint16_t)tileSize.height;
+                    runtime.meta.step_x = (int16_t)tileSize.width;
+                    runtime.meta.step_y = 1;
+                    runtime.meta.paint_pad_x = (uint8_t)std::min(255, std::max(0, opt.pixelMaskPadPx));
+                    runtime.meta.paint_pad_y = runtime.meta.paint_pad_x;
+                    runtime.meta.flags = 1;
+                    runtime.meta.class_id = (uint8_t)std::max(0, std::min(255, classId));
+                    runtime.meta.path = path;
+                    PixelGridRun run{};
+                    run.row = 0;
+                    run.col0 = 0;
+                    run.count = (uint16_t)len;
+                    runtime.meta.runs.push_back(run);
+                    int x0 = originX;
+                    int y0 = originY;
+                    cv::Rect paintRect(x0, y0, len * tileSize.width, tileSize.height);
+                    paintRect = expand_pixel_mask_box(paintRect, opt.pixelMaskPadPx, frameSize);
+                    cv::Vec3b maskColor = kind_color_from_kind_id(classId);
+                    if (opt.maskColor == "dominant" || opt.maskColor == "black" || opt.maskColor == "brown" || opt.maskColor == "rgb") {
+                        maskColor = choose_mask_color_bgr(opt, classId, dominant_bgr);
+                    }
+                    paint_pixel_rect_color(processed, mask_union_u8, paintRect, maskColor, opt.paintAlpha);
+                    for (int k = 0; k < len; ++k) {
+                        grouped[rowSnaps[i + (size_t)k].idx] = 1;
+                        runtime.cellBoxes.push_back((cv::Rect(originX + k * tileSize.width,
+                                                              originY,
+                                                              tileSize.width,
+                                                              tileSize.height) & bounds));
+                    }
+                    refCells += len;
+                    grid_groups.push_back(runtime.meta);
+                    runtime_groups.push_back(std::move(runtime));
+                }
+                i = j;
+            }
+        }
+    }
+
+    for (size_t i = 0; i < dets.size(); ++i) {
+        const auto &d = dets[i];
+        if (d.confidence < opt.confThreshold || d.box.area() <= 0 || d.seiPath.empty()) continue;
+        if (i < grouped.size() && grouped[i]) continue;
+        cv::Rect box = expand_pixel_mask_box(d.box, opt.pixelMaskPadPx, frameSize);
+        cv::Vec3b maskColor = kind_color_from_kind_id(d.classId);
+        if (opt.maskColor == "dominant" || opt.maskColor == "black" || opt.maskColor == "brown" || opt.maskColor == "rgb") {
+            maskColor = choose_mask_color_bgr(opt, d.classId, dominant_bgr);
+        }
+        paint_pixel_rect_color(processed, mask_union_u8, box, maskColor, opt.paintAlpha);
+        SEIRegion r{};
+        r.id = (uint32_t)legacy_regions.size();
+        r.x = (uint32_t)std::max(0, box.x);
+        r.y = (uint32_t)std::max(0, box.y);
+        r.w = (uint32_t)std::max(0, box.width);
+        r.h = (uint32_t)std::max(0, box.height);
+        r.flags = 1;
+        r.class_id = (uint8_t)std::max(0, std::min(255, d.classId));
+        r.path = d.seiPath;
+        legacy_regions.push_back(std::move(r));
+        refCells++;
+    }
+    return refCells;
+}
+
 static cv::Vec3b dominant_color_bgr_hist(const cv::Mat &frame_bgr) {
     if (frame_bgr.empty() || frame_bgr.type() != CV_8UC3) return cv::Vec3b(0, 0, 0);
     // Downsample for speed.
@@ -1855,6 +2078,150 @@ static cv::Vec3b dominant_color_bgr_hist(const cv::Mat &frame_bgr) {
     int g8 = g4 * 16 + 8;
     int r8 = r4 * 16 + 8;
     return cv::Vec3b((uchar)b8, (uchar)g8, (uchar)r8);
+}
+
+static cv::Vec3b dominant_color_bgr_hist_local(
+    const cv::Mat &frame_bgr,
+    const std::vector<DL_RESULT> &dets,
+    int pad_px
+) {
+    if (frame_bgr.empty() || frame_bgr.type() != CV_8UC3) return cv::Vec3b(0, 0, 0);
+    if (dets.empty() || pad_px <= 0) return dominant_color_bgr_hist(frame_bgr);
+
+    std::array<uint32_t, 4096> hist{};
+    hist.fill(0);
+    uint64_t samples = 0;
+    const cv::Rect frame_rect(0, 0, frame_bgr.cols, frame_bgr.rows);
+
+    for (const auto &d : dets) {
+        if (d.box.area() <= 0) continue;
+        cv::Rect expanded(
+            d.box.x - pad_px,
+            d.box.y - pad_px,
+            d.box.width + 2 * pad_px,
+            d.box.height + 2 * pad_px
+        );
+        expanded &= frame_rect;
+        if (expanded.area() <= 0) continue;
+
+        for (int y = expanded.y; y < expanded.y + expanded.height; ++y) {
+            const cv::Vec3b *row = frame_bgr.ptr<cv::Vec3b>(y);
+            const uchar *mask_row = (!d.boxMask.empty() && d.boxMask.type() == CV_8UC1 && d.boxMask.rows == frame_bgr.rows && d.boxMask.cols == frame_bgr.cols)
+                ? d.boxMask.ptr<uchar>(y)
+                : nullptr;
+            for (int x = expanded.x; x < expanded.x + expanded.width; ++x) {
+                // Sample the neighborhood, not the detected object itself.
+                if (mask_row && mask_row[x] != 0) continue;
+                cv::Vec3b p = row[x];
+                int b = p[0] >> 4;
+                int g = p[1] >> 4;
+                int r = p[2] >> 4;
+                int idx = (r << 8) | (g << 4) | b;
+                hist[(size_t)idx] += 1;
+                samples++;
+            }
+        }
+    }
+
+    if (samples == 0) return dominant_color_bgr_hist(frame_bgr);
+    uint32_t best = 0;
+    int best_idx = 0;
+    for (int i = 0; i < 4096; ++i) {
+        if (hist[(size_t)i] > best) { best = hist[(size_t)i]; best_idx = i; }
+    }
+    int b4 = best_idx & 0xF;
+    int g4 = (best_idx >> 4) & 0xF;
+    int r4 = (best_idx >> 8) & 0xF;
+    return cv::Vec3b((uchar)(b4 * 16 + 8), (uchar)(g4 * 16 + 8), (uchar)(r4 * 16 + 8));
+}
+
+static cv::Vec3b dominant_color_bgr_hist_region(
+    const cv::Mat &frame_bgr,
+    const DL_RESULT &det,
+    int pad_px,
+    const cv::Vec3b &fallback_bgr,
+    const std::string &stat
+) {
+    if (frame_bgr.empty() || frame_bgr.type() != CV_8UC3) return fallback_bgr;
+    if (det.box.area() <= 0 || pad_px <= 0) return fallback_bgr;
+
+    std::array<uint32_t, 4096> hist{};
+    hist.fill(0);
+    std::vector<uchar> bs;
+    std::vector<uchar> gs;
+    std::vector<uchar> rs;
+    bool use_median = (stat == "median");
+    bool use_average = (stat == "average");
+    uint64_t sum_b = 0, sum_g = 0, sum_r = 0;
+    uint64_t samples = 0;
+    const cv::Rect frame_rect(0, 0, frame_bgr.cols, frame_bgr.rows);
+    cv::Rect expanded(
+        det.box.x - pad_px,
+        det.box.y - pad_px,
+        det.box.width + 2 * pad_px,
+        det.box.height + 2 * pad_px
+    );
+    expanded &= frame_rect;
+    if (expanded.area() <= 0) return fallback_bgr;
+
+    for (int y = expanded.y; y < expanded.y + expanded.height; ++y) {
+        const cv::Vec3b *row = frame_bgr.ptr<cv::Vec3b>(y);
+        const uchar *mask_row = (!det.boxMask.empty() && det.boxMask.type() == CV_8UC1 && det.boxMask.rows == frame_bgr.rows && det.boxMask.cols == frame_bgr.cols)
+            ? det.boxMask.ptr<uchar>(y)
+            : nullptr;
+        for (int x = expanded.x; x < expanded.x + expanded.width; ++x) {
+            // Keep flat fill entropy low, but choose it from this object's immediate environment.
+            if (mask_row && mask_row[x] != 0) continue;
+            cv::Vec3b p = row[x];
+            if (use_median) {
+                bs.push_back(p[0]);
+                gs.push_back(p[1]);
+                rs.push_back(p[2]);
+            } else if (use_average) {
+                sum_b += p[0];
+                sum_g += p[1];
+                sum_r += p[2];
+            } else {
+                int b = p[0] >> 4;
+                int g = p[1] >> 4;
+                int r = p[2] >> 4;
+                int idx = (r << 8) | (g << 4) | b;
+                hist[(size_t)idx] += 1;
+            }
+            samples++;
+        }
+    }
+
+    if (samples == 0) return fallback_bgr;
+    if (use_median) {
+        auto median_channel = [](std::vector<uchar> &vals) -> uchar {
+            if (vals.empty()) return 0;
+            size_t mid = vals.size() / 2;
+            std::nth_element(vals.begin(), vals.begin() + (long)mid, vals.end());
+            return vals[mid];
+        };
+        return cv::Vec3b(median_channel(bs), median_channel(gs), median_channel(rs));
+    }
+    if (use_average) {
+        auto clamp_u8 = [](int v) -> uchar {
+            return (uchar)std::max(0, std::min(255, v));
+        };
+        return cv::Vec3b(
+            clamp_u8((int)std::lround((double)sum_b / (double)samples)),
+            clamp_u8((int)std::lround((double)sum_g / (double)samples)),
+            clamp_u8((int)std::lround((double)sum_r / (double)samples))
+        );
+    }
+
+    uint32_t best = 0;
+    int best_idx = 0;
+    for (int i = 0; i < 4096; ++i) {
+        if (hist[(size_t)i] > best) { best = hist[(size_t)i]; best_idx = i; }
+    }
+    int b4 = best_idx & 0xF;
+    int g4 = (best_idx >> 4) & 0xF;
+    int r4 = (best_idx >> 8) & 0xF;
+    return cv::Vec3b((uchar)(b4 * 16 + 8), (uchar)(g4 * 16 + 8), (uchar)(r4 * 16 + 8));
 }
 
 // -----------------------------------------------------------------------------
@@ -1927,6 +2294,69 @@ static void apply_fill_with_feather_bbox(
                 cv::Vec3b out;
                 for (int c = 0; c < 3; ++c) {
                     float v = (1.0f - w) * (float)o[c] + w * (float)f[c];
+                    out[c] = (uchar)clampi((int)std::lround(v), 0, 255);
+                }
+                drow[x] = out;
+            }
+        }
+    }
+}
+
+static void apply_flat_color_with_feather_bbox(
+    cv::Mat &dst_bgr,
+    const cv::Mat &orig_bgr,
+    const cv::Vec3b &fill_color,
+    const cv::Mat &mask_full_u8,
+    const cv::Rect &bbox,
+    int feather_px
+) {
+    if (dst_bgr.empty() || orig_bgr.empty() || mask_full_u8.empty()) return;
+    if (dst_bgr.type() != CV_8UC3 || orig_bgr.type() != CV_8UC3 || mask_full_u8.type() != CV_8UC1) return;
+    if (dst_bgr.size() != orig_bgr.size() || dst_bgr.size() != mask_full_u8.size()) return;
+
+    cv::Rect safe = bbox & cv::Rect(0, 0, dst_bgr.cols, dst_bgr.rows);
+    if (safe.area() <= 0) return;
+
+    cv::Mat mroi = mask_full_u8(safe);
+    if (cv::countNonZero(mroi) == 0) return;
+
+    if (feather_px <= 0) {
+        for (int y = safe.y; y < safe.y + safe.height; ++y) {
+            const uchar *mrow = mask_full_u8.ptr<uchar>(y);
+            cv::Vec3b *drow = dst_bgr.ptr<cv::Vec3b>(y);
+            for (int x = safe.x; x < safe.x + safe.width; ++x) {
+                if (mrow[x] == 0) continue;
+                drow[x] = fill_color;
+            }
+        }
+        return;
+    }
+
+    cv::Mat bin;
+    cv::threshold(mroi, bin, 0, 255, cv::THRESH_BINARY);
+    cv::Mat dist;
+    cv::distanceTransform(bin, dist, cv::DIST_L2, 3);
+
+    const float inv = 1.0f / (float)std::max(1, feather_px);
+    for (int yy = 0; yy < safe.height; ++yy) {
+        int y = safe.y + yy;
+        const uchar *mrow = mask_full_u8.ptr<uchar>(y);
+        const cv::Vec3b *orow = orig_bgr.ptr<cv::Vec3b>(y);
+        cv::Vec3b *drow = dst_bgr.ptr<cv::Vec3b>(y);
+        const float *drowf = dist.ptr<float>(yy);
+        for (int xx = 0; xx < safe.width; ++xx) {
+            int x = safe.x + xx;
+            if (mrow[x] == 0) continue;
+            float w = drowf[xx] * inv;
+            if (w <= 0.0f) {
+                drow[x] = orow[x];
+            } else if (w >= 1.0f) {
+                drow[x] = fill_color;
+            } else {
+                cv::Vec3b o = orow[x];
+                cv::Vec3b out;
+                for (int c = 0; c < 3; ++c) {
+                    float v = (1.0f - w) * (float)o[c] + w * (float)fill_color[c];
                     out[c] = (uchar)clampi((int)std::lround(v), 0, 255);
                 }
                 drow[x] = out;
@@ -2076,10 +2506,13 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
 
             if (codec == "libx264") {
                 std::ostringstream p;
-                p << "keyint=" << keyint
-                  << ":min-keyint=" << keyint
-                  << ":bframes=" << bframes;
-                if (opt.encNoScenecut) p << ":scenecut=0";
+                if (!opt.encOpenGopDefaults) {
+                    p << "keyint=" << keyint
+                      << ":min-keyint=" << keyint
+                      << ":";
+                    if (opt.encNoScenecut) p << "scenecut=0:";
+                }
+                p << "bframes=" << bframes;
                 if (opt.encRepeatHeaders) p << ":repeat-headers=1";
                 if (opt.encAud) p << ":aud=1";
                 paramFlag = "-x264-params";
@@ -2159,8 +2592,16 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
             // - libx264: allow baseline/main/high, etc.
             // - libx265: ffmpeg/x265 expects main/main10/etc. Passing baseline/high will fail.
             if (codec == "libx264") {
-                oss << "-profile:v " << opt.encProfile << " "
-                    << "-level:v " << opt.encLevel << " ";
+                std::string profile = opt.encProfile;
+                std::string level = opt.encLevel;
+                for (auto &ch : profile) ch = (char)std::tolower((unsigned char)ch);
+                for (auto &ch : level) ch = (char)std::tolower((unsigned char)ch);
+                if (!profile.empty() && profile != "none") {
+                    oss << "-profile:v " << opt.encProfile << " ";
+                }
+                if (!level.empty() && level != "none") {
+                    oss << "-level:v " << opt.encLevel << " ";
+                }
             }
             if (!extraCodecArgs.empty()) {
                 oss << extraCodecArgs << " ";
@@ -2665,7 +3106,9 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                             const auto &tmpl = g_pixel_templates[(size_t)ti];
                             DL_RESULT d{};
                             d.confidence = 1.0f;
-                            d.box = r;
+                            d.box = opt.pixelGridHeader ? (r & cv::Rect(0, 0, frame.cols, frame.rows))
+                                                        : expand_pixel_mask_box(r, opt.pixelMaskPadPx, frame.size());
+                            if (d.box.area() <= 0) continue;
                             d.boxMask = cv::Mat::zeros(frame.size(), CV_8UC1);
                             cv::rectangle(d.boxMask, d.box, cv::Scalar(255), cv::FILLED);
                             d.classId = tmpl.kindId;
@@ -2703,7 +3146,9 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                                 const auto &tmpl = g_pixel_templates[(size_t)ti];
                                 DL_RESULT d{};
                                 d.confidence = 1.0f;
-                                d.box = r;
+                                d.box = opt.pixelGridHeader ? (r & cv::Rect(0, 0, frame.cols, frame.rows))
+                                                            : expand_pixel_mask_box(r, opt.pixelMaskPadPx, frame.size());
+                                if (d.box.area() <= 0) continue;
                                 d.boxMask = cv::Mat::zeros(frame.size(), CV_8UC1);
                                 cv::rectangle(d.boxMask, d.box, cv::Scalar(255), cv::FILLED);
                                 d.classId = tmpl.kindId;
@@ -2758,11 +3203,18 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
         if (opt.maskColor == "dominant") {
             int period = std::max(1, opt.maskColorPeriod);
             if (frameIdx == 0 || (frameIdx % period) == 0) {
-                dominant_bgr = dominant_color_bgr_hist(frame);
+                if (opt.maskColorLocalPadPx > 0) {
+                    dominant_bgr = dominant_color_bgr_hist_local(frame, dets, opt.maskColorLocalPadPx);
+                } else {
+                    dominant_bgr = dominant_color_bgr_hist(frame);
+                }
             }
         }
 
         std::vector<SEIRegion> sei_regions;
+        std::vector<PixelGridGroup> pixel_grid_groups;
+        std::vector<PixelGridRuntimeGroup> pixel_grid_runtime_groups;
+        int pixel_grid_ref_regions = 0;
         if (seiOut.is_open()) sei_regions.reserve(dets.size());
         // Track which YOLO hashes are NEW in this frame. A real client cannot recover these
         // until the corresponding template is transmitted out-of-band.
@@ -2793,6 +3245,9 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
             total_occurrences++;
 
             if (opt.pixelMode) {
+                if (opt.pixelGridHeader) {
+                    continue;
+                }
                 // Pixel mode: paint with kind-consistent color (better motion prediction),
                 // while stitching uses template key (seiPath).
                 // If user explicitly requests a non-default masking color strategy (e.g. dominant),
@@ -3377,16 +3832,36 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                 }
             }
         }
+        if (opt.pixelMode && opt.pixelGridHeader) {
+            pixel_grid_ref_regions = build_pixel_grid_groups_and_paint(
+                dets, opt, frame.size(), dominant_bgr, processed, mask_union_u8,
+                sei_regions, pixel_grid_groups, pixel_grid_runtime_groups);
+            frame_masked_alpha_px = (uint64_t)cv::countNonZero(mask_union_u8);
+            frame_masked_bbox_px = frame_masked_alpha_px;
+        }
         // Apply fill + feather (YOLO mode only; pixel mode already painted above).
         if (!opt.pixelMode) {
             // Build fill frame (solid/blur/bg_ema/inpaint) using union mask for inpaint/bg_ema updates.
-            cv::Mat fill_bgr = make_fill_frame_bgr(frame, mask_union_u8, opt, dominant_bgr, bg_ema_f32, bg_ema_inited);
-            if (!fill_bgr.empty() && cv::countNonZero(mask_union_u8) > 0) {
+            bool per_region_flat_color =
+                opt.maskColorLocalPerRegion &&
+                opt.maskColor == "dominant" &&
+                opt.maskColorLocalPadPx > 0 &&
+                (opt.fillMode == "solid" || opt.fillMode.empty());
+            cv::Mat fill_bgr;
+            if (!per_region_flat_color) {
+                fill_bgr = make_fill_frame_bgr(frame, mask_union_u8, opt, dominant_bgr, bg_ema_f32, bg_ema_inited);
+            }
+            if ((per_region_flat_color || !fill_bgr.empty()) && cv::countNonZero(mask_union_u8) > 0) {
                 // Composite only within per-detection boxes to keep it fast.
                 for (size_t di = 0; di < dets.size(); ++di) {
                     if (di < det_masked.size() && det_masked[di] == 0) continue;
                     cv::Rect box = (di < det_stitch_boxes.size() && det_stitch_boxes[di].area() > 0) ? det_stitch_boxes[di] : dets[di].box;
-                    apply_fill_with_feather_bbox(processed, frame, fill_bgr, mask_union_u8, box, opt.featherPx);
+                    if (per_region_flat_color) {
+                        cv::Vec3b region_color = dominant_color_bgr_hist_region(frame, dets[di], opt.maskColorLocalPadPx, dominant_bgr, opt.maskColorLocalStat);
+                        apply_flat_color_with_feather_bbox(processed, frame, region_color, mask_union_u8, box, opt.featherPx);
+                    } else {
+                        apply_fill_with_feather_bbox(processed, frame, fill_bgr, mask_union_u8, box, opt.featherPx);
+                    }
                 }
             }
         }
@@ -3413,10 +3888,32 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
         // IMPORTANT: if a region was not masked on the server, the client should not waste
         // work stitching it (and it could even introduce artifacts).
         auto t_rec0 = std::chrono::steady_clock::now();
+        if (opt.pixelMode && opt.pixelGridHeader) {
+            for (const auto &group : pixel_grid_runtime_groups) {
+                cv::Mat tpl_rgba = get_pixel_template_rgba_by_path(group.meta.path);
+                if (tpl_rgba.empty()) continue;
+                for (const auto &cellBox : group.cellBoxes) {
+                    overlay_template_rgba(recovered, tpl_rgba, cellBox);
+                    matched_occurrences++;
+                }
+            }
+            for (const auto &r : sei_regions) {
+                if (r.path.empty()) continue;
+                cv::Mat tpl_rgba = get_pixel_template_rgba_by_path(r.path);
+                if (tpl_rgba.empty()) continue;
+                cv::Rect box((int)r.x, (int)r.y, (int)r.w, (int)r.h);
+                if (tpl_rgba.cols != box.width || tpl_rgba.rows != box.height) {
+                    cv::resize(tpl_rgba, tpl_rgba, box.size(), 0, 0, cv::INTER_NEAREST);
+                }
+                overlay_template_rgba(recovered, tpl_rgba, box);
+                matched_occurrences++;
+            }
+        }
         for (size_t di = 0; di < dets.size(); ++di) {
             const auto &d = dets[di];
             if (d.confidence < opt.confThreshold) continue;
             if (d.boxMask.empty()) continue;
+            if (opt.pixelMode && opt.pixelGridHeader) continue;
             if (!opt.pixelMode) {
                 if (di < det_masked.size() && det_masked[di] == 0) continue;
             }
@@ -3515,7 +4012,7 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
         // Determine ref/raw status and "successfully masked" count.
         int ref_regions = 0;
         if (opt.pixelMode) {
-            ref_regions = (int)sei_regions.size();
+            ref_regions = opt.pixelGridHeader ? pixel_grid_ref_regions : (int)sei_regions.size();
         } else {
             // In YOLO mode, sei_regions contains only actually-masked regions (except force-mask-all).
             if (!sei_regions.empty()) {
@@ -3554,6 +4051,9 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
         if (frame_flags_i == 0) {
             ref_regions = 0;
             sei_regions.clear();
+            pixel_grid_groups.clear();
+            pixel_grid_runtime_groups.clear();
+            pixel_grid_ref_regions = 0;
             frame_masked_bbox_px = 0;
             frame_masked_alpha_px = 0;
             mask_union_u8.setTo(cv::Scalar(0));
@@ -3563,7 +4063,8 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
             auto t_sei0 = std::chrono::steady_clock::now();
             uint64_t pts = (uint64_t)frameIdx;
             uint8_t frame_flags = (uint8_t)frame_flags_i;
-            std::vector<uint8_t> payload = build_msk1_payload((uint64_t)frameIdx, pts, sei_regions, /*version=*/4, frame_flags);
+            uint16_t msk1_version = (opt.pixelMode && opt.pixelGridHeader) ? 5 : 4;
+            std::vector<uint8_t> payload = build_msk1_payload((uint64_t)frameIdx, pts, sei_regions, msk1_version, frame_flags, pixel_grid_groups);
             uint32_t len = (uint32_t)payload.size();
             seiOut.write(reinterpret_cast<const char*>(&len), sizeof(len));
             if (len) seiOut.write(reinterpret_cast<const char*>(payload.data()), len);
@@ -3743,6 +4244,7 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
         {"enc_gop", opt.encGop},
         {"enc_bframes", opt.encBFrames},
         {"enc_scenecut", opt.encNoScenecut ? 0 : 1},
+        {"enc_open_gop_defaults", opt.encOpenGopDefaults},
         {"enc_preset", opt.encPreset},
         {"enc_tune", opt.encTune},
         {"enc_profile", opt.encProfile},
