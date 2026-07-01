@@ -204,7 +204,6 @@ def scatter_by_style(
             color=color,
             alpha=0.85,
         )
-    ax.set_title(title)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.3)
@@ -216,6 +215,105 @@ def scatter_by_style(
     fig.tight_layout()
     fig.savefig(out_path)
     plt.close(fig)
+
+
+STYLE_COLORS = {"photoreal": "tab:blue", "pixel_art": "#E6B800"}
+GAME_MARKERS = {"fc5": "o", "fm6": "s", "mario": "o"}
+GAME_LABELS = {"fc5": "FC5", "fm6": "FM6", "mario": "Mario"}
+
+
+def generality_scatter_plot(
+    rows: list[dict[str, Any]],
+    xkey: str,
+    ykey: str,
+    out_path: Path,
+    xlabel: str,
+    ylabel: str,
+    *,
+    photoreal_only: bool = False,
+) -> None:
+    if plt is None or not rows:
+        return
+    plot_rows = [r for r in rows if r.get("content_style") != "pixel_art"] if photoreal_only else list(rows)
+    if not plot_rows:
+        return
+
+    fig, ax = plt.subplots(figsize=(6.8, 4.2))
+    seen: set[tuple[str, str]] = set()
+    for row in plot_rows:
+        style = str(row.get("content_style", ""))
+        game = str(row.get("game", ""))
+        color = STYLE_COLORS.get(style, "tab:gray")
+        marker = GAME_MARKERS.get(game, "o")
+        label = None
+        key = (style, game)
+        if key not in seen:
+            if photoreal_only:
+                label = GAME_LABELS.get(game, game)
+            else:
+                label = "pixel art" if style == "pixel_art" else GAME_LABELS.get(game, game)
+            seen.add(key)
+        ax.scatter(
+            safe_float(row[xkey]),
+            safe_float(row[ykey]),
+            color=color,
+            marker=marker,
+            s=52,
+            alpha=0.9,
+            edgecolors="black",
+            linewidth=0.35,
+            label=label,
+        )
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
+def write_ref_ratio_table(rows: list[dict[str, Any]], out_dir: Path) -> None:
+    """Photoreal game averages — too few points for a readable scatter."""
+    photo = [r for r in rows if r.get("content_style") == "photoreal"]
+    if not photo:
+        return
+    by_game: dict[str, list[dict[str, Any]]] = {}
+    for row in photo:
+        by_game.setdefault(str(row.get("game", "")), []).append(row)
+
+    md_lines = [
+        "# BSP vs Ref ratio (photoreal game averages, CRF23 intake)",
+        "",
+        "Mario pixel clips omitted: Ref ratio saturates at 1.0 (templates assumed pre-known).",
+        "",
+        "| Game | Ref ratio | BSP (%) | Masked area (%) | Template reuse |",
+        "| --- | ---: | ---: | ---: | ---: |",
+    ]
+    tex_lines = [
+        r"\begin{tabular}{@{}lrrrr@{}}",
+        r"\toprule",
+        r"\textbf{Game} & \textbf{Ref ratio} & \textbf{BSP} (\%) & \textbf{Masked area} (\%) & \textbf{Template reuse} \\",
+        r"\midrule",
+    ]
+    for game_key in sorted(by_game):
+        game_rows = by_game[game_key]
+        game = GAME_LABELS.get(game_key, game_key.upper())
+        ref_r = float(np.mean([safe_float(row.get("ref_ratio", 0.0)) for row in game_rows]))
+        bsp = float(np.mean([safe_float(row.get("bsp_pct", 0.0)) for row in game_rows]))
+        area = float(np.mean([safe_float(row.get("avg_masked_area_pct", 0.0)) for row in game_rows]))
+        reuse = float(np.mean([safe_float(row.get("template_reuse_rate", 0.0)) for row in game_rows]))
+        md_lines.append(
+            f"| {game} | {ref_r:.3f} | {bsp:.1f} | {area:.1f} | {reuse:.3f} |"
+        )
+        tex_lines.append(
+            f"{game} & {ref_r:.3f} & {bsp:.1f} & {area:.1f} & {reuse:.3f} \\\\"
+        )
+    tex_lines.extend([r"\bottomrule", r"\end{tabular}"])
+    md_lines.append("")
+
+    (out_dir / "bsp_vs_ref_ratio.md").write_text("\n".join(md_lines), encoding="utf-8")
+    (out_dir / "bsp_vs_ref_ratio.tex").write_text("\n".join(tex_lines) + "\n", encoding="utf-8")
 
 
 def envelope_band_plot(
@@ -231,8 +329,12 @@ def envelope_band_plot(
 ) -> None:
     if plt is None or not rows:
         return
-    # For the paper plot, focus on cases where RESPAWN actually saves bandwidth.
     positive_rows = [r for r in rows if safe_float(r.get("bsp_pct", 0.0)) > 0.0]
+    all_points = [
+        (safe_float(r[xkey]), safe_float(r[ykey]), str(r.get("content_style", "")))
+        for r in rows
+        if math.isfinite(safe_float(r[xkey])) and math.isfinite(safe_float(r[ykey]))
+    ]
     points = [
         (safe_float(r[xkey]), safe_float(r[ykey]), str(r.get("content_style", "")))
         for r in positive_rows
@@ -274,10 +376,19 @@ def envelope_band_plot(
     band_high = np.maximum(lower_curve, upper_curve)
 
     fig, ax = plt.subplots(figsize=(6.8, 4.2))
+    style_colors = {"photoreal": "tab:blue", "pixel_art": "tab:orange"}
+    for x, y, style in all_points:
+        ax.scatter(
+            x,
+            y,
+            color=style_colors.get(style, "tab:gray"),
+            alpha=0.35,
+            s=18,
+            edgecolors="none",
+        )
     ax.fill_between(xx, band_low, band_high, color="tab:blue", alpha=0.16, label="middle region")
     ax.plot(xx, band_high, color="tab:green", linewidth=2.0, label="upper envelope")
     ax.plot(xx, band_low, color="tab:red", linewidth=2.0, label="lower envelope")
-    style_colors = {"photoreal": "tab:blue", "pixel_art": "tab:orange"}
     used_labels: set[str] = set()
     for x, y, style in upper:
         label = f"{style} high" if style not in used_labels else None
@@ -287,7 +398,6 @@ def envelope_band_plot(
         label = f"{style} low" if f"{style}_low" not in used_labels else None
         ax.scatter(x, y, color=style_colors.get(style, "tab:gray"), marker="v", s=52, edgecolor="black", linewidth=0.4, label=label)
         used_labels.add(f"{style}_low")
-    ax.set_title(title)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.3)
@@ -406,9 +516,18 @@ def main() -> None:
             writer.writerow(row)
 
     if rows:
-        envelope_band_plot(rows, "avg_masked_area_pct", "bsp_pct", args.out_dir / "bsp_vs_masked_area.png", "Positive-BSP envelope vs average masked area", "Average masked area (%)", "BSP (%)")
-        envelope_band_plot(rows, "ref_ratio", "bsp_pct", args.out_dir / "bsp_vs_ref_ratio.png", "Positive-BSP envelope vs Ref ratio", "Ref ratio", "BSP (%)")
-        envelope_band_plot(rows, "motion_magnitude_roi", "roi_vmaf_mean", args.out_dir / "roi_vmaf_vs_motion.png", "Positive-BSP ROI VMAF envelope vs motion magnitude", "Motion magnitude inside ROI", "ROI VMAF")
+        generality_scatter_plot(
+            rows,
+            "avg_masked_area_pct",
+            "bsp_pct",
+            args.out_dir / "bsp_vs_masked_area.png",
+            "Average masked area (%)",
+            "BSP (%)",
+        )
+        write_ref_ratio_table(rows, args.out_dir)
+        ref_png = args.out_dir / "bsp_vs_ref_ratio.png"
+        if ref_png.exists():
+            ref_png.unlink()
 
         gop_savings_by_game: dict[str, list[float]] = {}
         for row in rows:
@@ -433,17 +552,25 @@ def main() -> None:
                         if idx < len(msk1_sizes):
                             resp_sum += float(msk1_sizes[idx])
                     if base_sum > 1e-9:
-                        game = str(row.get("game", "unknown"))
-                        gop_savings_by_game.setdefault(game, []).append((1.0 - (resp_sum / base_sum)) * 100.0)
+                        saving_pct = (1.0 - (resp_sum / base_sum)) * 100.0
+                        if -50.0 <= saving_pct <= 50.0:
+                            game = str(row.get("game", "unknown"))
+                            gop_savings_by_game.setdefault(game, []).append(saving_pct)
         if plt is not None and any(values for values in gop_savings_by_game.values()):
             fig, ax = plt.subplots(figsize=(6.5, 4.0))
-            game_colors = {"fc5": "tab:blue", "fm6": "tab:green", "mario": "tab:orange"}
+            game_colors = {"fc5": "tab:blue", "fm6": "tab:green", "mario": "#E6B800"}
             for game in sorted(gop_savings_by_game):
                 xs, ys = cdf(gop_savings_by_game[game])
                 if xs.size == 0:
                     continue
-                ax.plot(xs, ys, linewidth=2.0, color=game_colors.get(game, None), label=game.upper() if game != "mario" else "Mario")
-            ax.set_title("CDF of per-GOP savings by game")
+                ax.plot(
+                    xs,
+                    ys,
+                    linewidth=2.0,
+                    color=game_colors.get(game, None),
+                    label=GAME_LABELS.get(game, game.upper()),
+                )
+            ax.set_xlim(-50.0, 50.0)
             ax.set_xlabel("Per-GOP savings (%)")
             ax.set_ylabel("CDF")
             ax.grid(True, alpha=0.3)
@@ -475,8 +602,9 @@ def main() -> None:
             "- Use `edge_density`, `sobel_energy`, `gray_variance`, and `gray_entropy` as texture/complexity proxies rather than as hard causal claims.",
             "- Keep the photoreal vs pixel-art comparison descriptive unless enough clips exist in both families to support stronger statistical statements.",
             "- For photoreal clips, `avg_masked_area_pct` is measured from alpha/mask pixels. For pixel-art clips, it is measured from the emitted template region boxes (`sum w*h / frame area`) because the pixel template path does not populate alpha-mask pixels.",
-            "- The scatter figures filter out negative-BSP points and show only upper/lower envelope curves; the transparent band is the observed positive-saving region, while middle points are intentionally hidden to reduce visual clutter. Envelope points are colored by content style so pixel-art and photoreal clips remain distinguishable.",
-            "- The per-GOP savings CDF is plotted per game in one figure, not averaged across clips, so workload-specific tails remain visible.",
+            "- The scatter figure `bsp_vs_masked_area.png` shows styled points only (yellow pixel art, blue photoreal).",
+            "- `bsp_vs_ref_ratio.tex` / `.md` tabulate photoreal game averages only; Mario omitted (Ref ratio = 1.0).",
+            "- The per-GOP savings CDF drops GOP windows outside [-50%, +50%] and clamps the x-axis to that range.",
         ]
         (args.out_dir / "generality_notes.md").write_text("\n".join(summary_lines) + "\n")
 

@@ -15,6 +15,7 @@ except ModuleNotFoundError:
     plt = None
 
 from common import CURRENT_BASELINE_BIN, DEFAULT_MODEL, OFFLINE_BIN, RESPAWN2026_DIR, ensure_dir, load_manifest, safe_name
+from pixel_mario_defaults import mario_pixel_args
 from video_metrics import compute_video_metrics
 
 
@@ -199,21 +200,7 @@ def learned_ablation_configs(clip: Any) -> list[dict[str, Any]]:
 
 
 def mario_ablation_configs() -> list[dict[str, Any]]:
-    base = [
-        "--pixel",
-        "-T",
-        str(PIXEL_SINGLE_TEMPLATE),
-        "--pixel-force-scale",
-        "1.0",
-        "--mask-color",
-        "dominant",
-        "--mask-color-period",
-        "200",
-        "--fill-mode",
-        "solid",
-        "--feather-px",
-        "0",
-    ]
+    base = mario_pixel_args()
     return [
         {"name": "full_pipeline", "args": base, "kind": "mario"},
         {"name": "no_optical_flow", "args": base + ["--pixel-flow", "0"], "kind": "mario"},
@@ -259,6 +246,26 @@ def plot_ablation(rows: list[dict[str, Any]], out_dir: Path) -> None:
 
 
 def encoder_args(args: argparse.Namespace) -> list[str]:
+    if getattr(args, "exp35_encoder", False):
+        return [
+            "--enc-codec",
+            "libx264",
+            "--enc-crf",
+            "23",
+            "--enc-preset",
+            "medium",
+            "--enc-tune",
+            "none",
+            "--enc-profile",
+            "none",
+            "--enc-level",
+            "none",
+            "--enc-open-gop-defaults",
+            "--enc-aud",
+            "1",
+            "--enc-repeat-headers",
+            "0",
+        ]
     base = [
         "--enc-gop",
         "60",
@@ -312,6 +319,8 @@ def main() -> None:
     ap.add_argument("--max-frames", type=int, default=0)
     ap.add_argument("--config-kinds", nargs="*", default=[])
     ap.add_argument("--clip-ids", nargs="*", default=[])
+    ap.add_argument("--exp35-encoder", action="store_true", help="Use the CRF23/open-GOP encoder stack from Exp3/Exp5.")
+    ap.add_argument("--use-normalized-input", action="store_true", help="Use manifest-normalized clips directly instead of rematerializing source windows.")
     args = ap.parse_args()
 
     ensure_dir(args.out_dir)
@@ -333,10 +342,10 @@ def main() -> None:
             clip_configs = [cfg for cfg in clip_configs if cfg.get("kind") in set(args.config_kinds)]
         if not clip_configs:
             continue
-        clip_input = materialize_source_window(clip, args.out_dir)
+        clip_input = str(Path(clip.normalized_path)) if args.use_normalized_input else materialize_source_window(clip, args.out_dir)
         clip_model = model_for_clip(clip)
         baseline_dir = args.out_dir / safe_name(clip.clip_id) / "_baseline_current"
-        if not (baseline_dir / "report.json").exists():
+        if not args.exp35_encoder and not (baseline_dir / "report.json").exists():
             ensure_dir(baseline_dir)
             baseline_game_args = []
             if clip.game == "mario":
@@ -371,16 +380,17 @@ def main() -> None:
                 continue
             run_dir = args.out_dir / safe_name(clip.clip_id) / safe_name(cfg["name"])
             ensure_dir(run_dir)
-            cmd = [
-                str(OFFLINE_BIN),
-                "-i",
-                clip_input,
-                "-o",
-                str(run_dir),
-                "-m",
-                str(clip_model),
-            ] + encoder_args(args) + (["--max-frames", str(args.max_frames)] if args.max_frames > 0 else []) + list(cfg["args"])
-            subprocess.run(cmd, check=True)
+            if not (run_dir / "report.json").exists():
+                cmd = [
+                    str(OFFLINE_BIN),
+                    "-i",
+                    clip_input,
+                    "-o",
+                    str(run_dir),
+                    "-m",
+                    str(clip_model),
+                ] + encoder_args(args) + (["--max-frames", str(args.max_frames)] if args.max_frames > 0 else []) + list(cfg["args"])
+                subprocess.run(cmd, check=True)
             report = json.loads((run_dir / "report.json").read_text())
             per = report.get("per_frame", []) or []
             duration_min = (len(per) / max(1e-9, fps_from_report(report, clip.source_fps) * 60.0)) if per else 0.0

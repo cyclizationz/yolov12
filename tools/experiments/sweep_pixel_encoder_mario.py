@@ -33,11 +33,8 @@ from common import (
     normalize_clip,
     python_bin,
 )
+from pixel_mario_defaults import PIXEL_TEMPLATES, mario_pixel_args
 from video_metrics import compute_video_metrics
-
-MANIFEST = RESPAWN2026_DIR / "manifest" / "offline_manifest.json"
-PIXEL_TEMPLATES = REPO_ROOT / "experiments" / "encoder_eval/_pixel_single_template"
-ENCODE_PURE = REPO_ROOT / "tools" / "experiments" / "encode_pure_streaming_baseline.py"
 
 # Plan defaults
 DEFAULT_ANCHOR_MBPS = 16.0
@@ -139,46 +136,7 @@ def stats_changed_pixels(report: dict[str, Any]) -> tuple[float, float]:
 
 def mario_pixel_base(peaks: int, bootstrap: int, flow: int, thr_k: float) -> list[str]:
     """Mario preset aligned with run_rd_suite.common_variant_args, with swept pixel knobs."""
-    return [
-        "--pixel",
-        "-T",
-        str(PIXEL_TEMPLATES),
-        "--pixel-force-scale",
-        "1.0",
-        "--pixel-mask-pad",
-        "2",
-        "--pixel-grid-header",
-        "--pixel-grid-snap",
-        "12",
-        "--pixel-band-pad-y",
-        "80",
-        "--pixel-bands",
-        "4",
-        "--pixel-max-peaks",
-        str(peaks),
-        "--pixel-bootstrap",
-        str(bootstrap),
-        "--pixel-flow",
-        str(flow),
-        "--pixel-adaptive-thr",
-        "1",
-        "--pixel-thr-k",
-        str(thr_k),
-        "--pixel-thr-lo",
-        "0.30",
-        "--pixel-thr-hi",
-        "0.65",
-        "--pixel-min-score",
-        "0.65",
-        "--mask-color",
-        "dominant",
-        "--mask-color-period",
-        "200",
-        "--fill-mode",
-        "solid",
-        "--feather-px",
-        "0",
-    ]
+    return mario_pixel_args(peaks=peaks, bootstrap=bootstrap, flow=flow, thr_k=thr_k)
 
 
 def enc_args(

@@ -66,6 +66,27 @@ add_executable(${PROJECT_NAME}Duo
     offline_processor_duo.cpp
     offline_processor_duo.h
 )
+add_executable(RespawnOnlineServer
+    server/online_server.cpp
+    inference.cpp
+    inference.h
+    sei_parser.cpp
+    sei_parser.h
+    offline_processor.cpp
+    offline_processor.h
+)
+add_executable(RespawnOnlineClient
+    client/online_client.cpp
+    sei_parser.cpp
+    sei_parser.h
+    template_ipc.cpp
+    template_ipc.h
+)
+add_executable(RespawnTemplateServer
+    server/template_server.cpp
+    template_ipc.cpp
+    template_ipc.h
+)
 
 # -------------- SSL ------------------#
 find_package(OpenSSL REQUIRED)
@@ -75,16 +96,21 @@ include_directories(${OPENSSL_INCLUDE_DIR})
 target_link_libraries(${PROJECT_NAME} ${OpenCV_LIBS} ${ONNXRUNTIME_ROOT}/lib/libonnxruntime.so OpenSSL::SSL OpenSSL::Crypto)
 target_link_libraries(${PROJECT_NAME}CurrentBaseline ${OpenCV_LIBS} ${ONNXRUNTIME_ROOT}/lib/libonnxruntime.so OpenSSL::SSL OpenSSL::Crypto)
 target_link_libraries(${PROJECT_NAME}Duo ${OpenCV_LIBS} ${ONNXRUNTIME_ROOT}/lib/libonnxruntime.so OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(RespawnOnlineServer ${OpenCV_LIBS} ${ONNXRUNTIME_ROOT}/lib/libonnxruntime.so OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(RespawnOnlineClient OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(RespawnTemplateServer OpenSSL::SSL OpenSSL::Crypto)
 if (USE_CUDA)
     # CUDA provider is a plugin .so loaded by ORT, but linking it ensures ldd/packaging catches it.
     target_link_libraries(${PROJECT_NAME} ${ONNXRUNTIME_ROOT}/lib/libonnxruntime_providers_cuda.so)
     target_link_libraries(${PROJECT_NAME}CurrentBaseline ${ONNXRUNTIME_ROOT}/lib/libonnxruntime_providers_cuda.so)
     target_link_libraries(${PROJECT_NAME}Duo ${ONNXRUNTIME_ROOT}/lib/libonnxruntime_providers_cuda.so)
+    target_link_libraries(RespawnOnlineServer ${ONNXRUNTIME_ROOT}/lib/libonnxruntime_providers_cuda.so)
 endif ()
 if (USE_CUDA)
     target_link_libraries(${PROJECT_NAME} ${CUDA_LIBRARIES})
     target_link_libraries(${PROJECT_NAME}CurrentBaseline ${CUDA_LIBRARIES})
     target_link_libraries(${PROJECT_NAME}Duo ${CUDA_LIBRARIES})
+    target_link_libraries(RespawnOnlineServer ${CUDA_LIBRARIES})
 endif ()
 
 # -------------- Resources ------------------#

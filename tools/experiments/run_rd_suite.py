@@ -32,6 +32,16 @@ from common import (
     python_bin,
     safe_name,
 )
+from pixel_mario_defaults import (
+    FC5_MASK_GLOBAL,
+    FC5_MASK_PROFILES,
+    exp1_refresh_note,
+    fc5_mask_profile_args,
+    fc5_mask_profile_protocol_line,
+    mario_encoder_protocol_line,
+    mario_pixel_args,
+    mario_pixel_protocol_line,
+)
 from video_metrics import compute_video_metrics
 
 
@@ -40,7 +50,6 @@ def _default_metric_threads() -> int:
     return max(1, min(32, (os.cpu_count() or 8)))
 
 
-PIXEL_TEMPLATES = Path("/home/tiehangz/proj/yolov12/experiments/encoder_eval/_pixel_single_template")
 FM6_MODEL = Path("/home/tiehangz/proj/yolov12/deployment/yolov12n_racing_e300_split1.onnx")
 FC5_MODEL = Path("/home/tiehangz/proj/yolov12/deployment/yolov12n_fc5_seg_v1.onnx")
 FM6_LATENT_BANK = Path("/home/tiehangz/proj/yolov12/experiments/encoder_eval/fm6_index_full_v1/dict/latent_bank.json")
@@ -213,6 +222,7 @@ def write_protocol_note(
     *,
     ref_label: str,
     ref_variant: str,
+    fc5_mask_profile: str,
 ) -> None:
     text = "\n".join(
         [
@@ -220,13 +230,16 @@ def write_protocol_note(
             "",
             "This file records the exact Experiment 1 protocol used by `run_rd_suite.py`.",
             "",
+            exp1_refresh_note().rstrip(),
+            "",
             "## Current protocol",
             f"- Reference arm: `{ref_label}` (`variant={ref_variant}`)",
             "- Input assets: manifest-normalized clips (`1920x1080@60` for learned games; source geometry/FPS for Mario pixel clips)",
             "- Rate control: fixed target bitrate sweep at `8/12/16/20/24 Mbps` with matched `maxrate` and `bufsize=2x bitrate`",
-            "- Encoder defaults: `libx264`, `superfast`, `gop=60`, `scenecut=0`, `tune=none`, `aud=1`, `repeat-headers=1`",
+            "- Encoder defaults (all games): `libx264`, `medium`, open GOP (`--enc-open-gop-defaults`), fixed VBV at `8/12/16/20/24 Mbps`",
             "- Current FC5 Exp1 setting is an upper-bound non-heal mode: latent-key masking without `--yolo-heal-only`",
-            "- Mario pixel mode uses native template scale, 2px mask padding, compact grid headers, and widened band scan: `pixel-force-scale=1.0`, `pixel-mask-pad=2`, `pixel-grid-header`, `pixel-grid-snap=12`, `pixel-band-pad-y=80`, `pixel-bands=4`, `pixel-max-peaks=60`",
+            fc5_mask_profile_protocol_line(fc5_mask_profile),
+            mario_pixel_protocol_line(),
             "- RESPAWN quality is measured on `recovered_output.mp4` against the normalized input clip",
             "- Achieved bitrate is measured from `segmented_output.mp4` plus `msk1_payloads.bin` sidecar bitrate",
             "- BD-rate is averaged per clip first, then averaged across clips in the same game",
@@ -564,6 +577,8 @@ def write_rd_summary_doc(
         "",
         f"Reference arm: {ref_label}",
         "",
+        exp1_refresh_note().rstrip(),
+        "",
         "The compact table below reports mean equal-quality bitrate reduction and BD-Rate for each game.",
         "",
     ]
@@ -616,34 +631,9 @@ def model_for_clip(clip: Any) -> Path:
     return Path(DEFAULT_MODEL)
 
 
-def common_variant_args(clip: Any) -> list[str]:
+def common_variant_args(clip: Any, *, fc5_mask_profile: str = FC5_MASK_GLOBAL) -> list[str]:
     if clip.game == "mario":
-        return [
-            "--pixel",
-            "-T",
-            str(PIXEL_TEMPLATES),
-            "--pixel-force-scale",
-            "1.0",
-            "--pixel-mask-pad",
-            "2",
-            "--pixel-grid-header",
-            "--pixel-grid-snap",
-            "12",
-            "--pixel-band-pad-y",
-            "80",
-            "--pixel-bands",
-            "4",
-            "--pixel-max-peaks",
-            "60",
-            "--mask-color",
-            "dominant",
-            "--mask-color-period",
-            "200",
-            "--fill-mode",
-            "solid",
-            "--feather-px",
-            "0",
-        ]
+        return mario_pixel_args()
     latent_bank = FM6_LATENT_BANK if clip.game == "fm6" else FC5_LATENT_BANK
     latent_thr = "0.85" if clip.game == "fc5" else "0.86"
     args = [
@@ -669,9 +659,31 @@ def common_variant_args(clip: Any) -> list[str]:
         "--feather-px",
         "4",
     ]
+    if clip.game == "fc5":
+        args.extend(fc5_mask_profile_args(fc5_mask_profile))
     if clip.game == "fm6":
         args.insert(1, "--yolo-heal-only")
     return args
+
+
+def encoder_args_for_game(game: str, *, enc_gop: int) -> list[str]:
+    """Exp1 encoder: fixed VBV + medium preset + open GOP for all games."""
+    _ = game
+    return [
+        "--enc-gop",
+        str(enc_gop),
+        "--enc-preset",
+        "medium",
+        "--enc-tune",
+        "none",
+        "--enc-scenecut",
+        "0",
+        "--enc-aud",
+        "1",
+        "--enc-repeat-headers",
+        "1",
+        "--enc-open-gop-defaults",
+    ]
 
 
 def resolve_video_in_run_or_backup(
@@ -699,7 +711,10 @@ def variant_run_complete(
     *,
     suite_out_dir: Path,
     video_backup_root: Path | None,
+    force: bool = False,
 ) -> bool:
+    if force:
+        return False
     for name in ("report.json", "per_frame_metrics.csv"):
         if not (run_dir / name).exists():
             return False
@@ -721,11 +736,15 @@ def run_variant(
     model: Path,
     bitrate: float,
     enc_gop: int,
+    game: str,
     extra_args: list[str],
     common_args: list[str],
     use_cuda: bool,
+    force: bool = False,
 ) -> None:
-    if variant_run_complete(out_dir, suite_out_dir=suite_out_dir, video_backup_root=video_backup_root):
+    if variant_run_complete(
+        out_dir, suite_out_dir=suite_out_dir, video_backup_root=video_backup_root, force=force
+    ):
         print(f"[SKIP] {variant} already complete: {out_dir}", flush=True)
         return
     if report_only:
@@ -748,19 +767,7 @@ def run_variant(
         str(bitrate),
         "--enc-bufsize-mbits",
         str(2.0 * bitrate),
-        "--enc-gop",
-        str(enc_gop),
-        "--enc-preset",
-        "superfast",
-        "--enc-tune",
-        "none",
-        "--enc-scenecut",
-        "0",
-        "--enc-aud",
-        "1",
-        "--enc-repeat-headers",
-        "1",
-    ] + common_args + list(extra_args)
+    ] + encoder_args_for_game(game, enc_gop=enc_gop) + common_args + list(extra_args)
     subprocess.run(cmd, check=True)
     subprocess.run(
         [
@@ -782,43 +789,33 @@ def run_pure_streaming_variant(
     report_only: bool,
     bitrate: float,
     enc_gop: int,
+    game: str,
+    force: bool = False,
 ) -> None:
-    if variant_run_complete(out_dir, suite_out_dir=suite_out_dir, video_backup_root=video_backup_root):
+    if variant_run_complete(
+        out_dir, suite_out_dir=suite_out_dir, video_backup_root=video_backup_root, force=force
+    ):
         print(f"[SKIP] pure_streaming already complete: {out_dir}", flush=True)
         return
     if report_only:
         print(f"[SKIP] pure_streaming incomplete (report-only): {out_dir}", flush=True)
         return
     enc = REPO_ROOT / "tools" / "experiments" / "encode_pure_streaming_baseline.py"
-    subprocess.run(
-        [
-            python_bin(),
-            str(enc),
-            "--input",
-            clip_path,
-            "--out-dir",
-            str(out_dir),
-            "--bitrate-mbps",
-            str(bitrate),
-            "--enc-maxrate-mbps",
-            str(bitrate),
-            "--enc-bufsize-mbits",
-            str(2.0 * bitrate),
-            "--enc-gop",
-            str(enc_gop),
-            "--enc-preset",
-            "superfast",
-            "--enc-tune",
-            "none",
-            "--enc-scenecut",
-            "0",
-            "--enc-aud",
-            "1",
-            "--enc-repeat-headers",
-            "1",
-        ],
-        check=True,
-    )
+    cmd = [
+        python_bin(),
+        str(enc),
+        "--input",
+        clip_path,
+        "--out-dir",
+        str(out_dir),
+        "--bitrate-mbps",
+        str(bitrate),
+        "--enc-maxrate-mbps",
+        str(bitrate),
+        "--enc-bufsize-mbits",
+        str(2.0 * bitrate),
+    ] + encoder_args_for_game(game, enc_gop=enc_gop)
+    subprocess.run(cmd, check=True)
     subprocess.run(
         [
             python_bin(),
@@ -1019,6 +1016,22 @@ def main() -> None:
         default="rd_suite",
         help="Stem for points/bd-rate/summary outputs, e.g. rd_suite or rd_suite_legacy.",
     )
+    ap.add_argument(
+        "--fc5-mask-profile",
+        choices=FC5_MASK_PROFILES,
+        default=FC5_MASK_GLOBAL,
+        help="FC5 mask/fill profile for RESPAWN runs.",
+    )
+    ap.add_argument(
+        "--force-respawn",
+        action="store_true",
+        help="Re-encode respawn_hysteresis even when outputs look complete.",
+    )
+    ap.add_argument(
+        "--force-pure",
+        action="store_true",
+        help="Re-encode pure_streaming even when outputs look complete.",
+    )
     args = ap.parse_args()
     configure_paper_plot_style()
 
@@ -1056,7 +1069,7 @@ def main() -> None:
             clip_input = resolve_rd_input(clip)
             ref_video = clip_input
             model = Path(args.model) if Path(args.model) != Path(DEFAULT_MODEL) else model_for_clip(clip)
-            common_args = common_variant_args(clip)
+            common_args = common_variant_args(clip, fc5_mask_profile=args.fc5_mask_profile)
             print(f"[RD] clip {clip.clip_id} ({clip.game}) input={clip_input}", flush=True)
             for bitrate in args.bitrate_mbps:
                 rate_tag = bitrate_label_mbps(bitrate)
@@ -1079,9 +1092,11 @@ def main() -> None:
                         model=model,
                         bitrate=bitrate,
                         enc_gop=args.enc_gop,
+                        game=clip.game,
                         extra_args=list(args.baseline_extra_args),
                         common_args=common_args,
                         use_cuda=not args.no_cuda,
+                        force=args.force_pure,
                     )
                 else:
                     run_pure_streaming_variant(
@@ -1092,6 +1107,8 @@ def main() -> None:
                         report_only=args.report_only,
                         bitrate=bitrate,
                         enc_gop=args.enc_gop,
+                        game=clip.game,
+                        force=args.force_pure,
                     )
                 run_variant(
                     bin_path=OFFLINE_BIN,
@@ -1104,9 +1121,11 @@ def main() -> None:
                     model=model,
                     bitrate=bitrate,
                     enc_gop=args.enc_gop,
+                    game=clip.game,
                     extra_args=list(args.respawn_extra_args),
                     common_args=common_args,
                     use_cuda=not args.no_cuda,
+                    force=args.force_respawn,
                 )
 
                 print(f"[RD]   {clip.clip_id} @ {rate_tag} — compute metrics {ref_variant} …", flush=True)
@@ -1164,7 +1183,12 @@ def main() -> None:
         ref_label=ref_label,
         summary_md_name=summary_md_name,
     )
-    write_protocol_note(args.out_dir, ref_label=ref_label, ref_variant=ref_variant)
+    write_protocol_note(
+        args.out_dir,
+        ref_label=ref_label,
+        ref_variant=ref_variant,
+        fc5_mask_profile=args.fc5_mask_profile,
+    )
     for metric_key, label, _, _ in EQ_TARGET_SPECS:
         plot_metric_triptych(metric_key, label, game_rows, figure_dir, ref_variant=ref_variant, ref_label=ref_label)
     write_latex_tables(game_rows, bd_summary, figure_dir, ref_variant=ref_variant, ref_label=ref_label)
