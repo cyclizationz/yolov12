@@ -55,6 +55,40 @@ def avg_key(rows: list[dict], key: str) -> float:
     return mean(vals) if vals else 0.0
 
 
+def frame_component_ms(item: dict) -> dict[str, float]:
+    """System path only: server detection/postprocess through client stitching."""
+    dict_ms = float(item.get("dict_ms", 0.0) or 0.0)
+    postprocess_ms = float(item.get("postprocess_ms", 0.0) or 0.0)
+    model_post_ms = max(0.0, postprocess_ms - dict_ms)
+
+    pixel_detect_ms = (
+        float(item.get("pixel_bootstrap_ms", 0.0) or 0.0)
+        + float(item.get("pixel_roi_ms", 0.0) or 0.0)
+        + float(item.get("pixel_band_ms", 0.0) or 0.0)
+        + float(item.get("pixel_row_ms", 0.0) or 0.0)
+        + float(item.get("pixel_flow_ms", 0.0) or 0.0)
+    )
+    learned_detect_ms = (
+        float(item.get("preprocess_ms", 0.0) or 0.0)
+        + float(item.get("inference_ms", 0.0) or 0.0)
+        + model_post_ms
+    )
+    detect_ms = learned_detect_ms if learned_detect_ms > 0.0 else pixel_detect_ms
+    masking_ms = float(item.get("masking_ms", item.get("paint_ms", 0.0)) or 0.0)
+    stitching_ms = float(item.get("stitching_ms", item.get("recover_ms", 0.0)) or 0.0)
+    system_ms = detect_ms + dict_ms + masking_ms + stitching_ms
+    return {
+        "system_ms": system_ms,
+        "detect_ms": detect_ms,
+        "preprocess_ms": float(item.get("preprocess_ms", 0.0) or 0.0),
+        "inference_ms": float(item.get("inference_ms", 0.0) or 0.0),
+        "model_post_ms": model_post_ms,
+        "dict_ms": dict_ms,
+        "masking_ms": masking_ms,
+        "stitching_ms": stitching_ms,
+    }
+
+
 def parse_gpu_usage(path: Path, cpu_mode: bool) -> dict[str, str]:
     raw = path.read_text(errors="replace").strip()
     default_status = "cpu-only" if cpu_mode else "unavailable"
@@ -144,15 +178,19 @@ def build_rows() -> list[dict[str, str]]:
         cpu_mode = "--cpu" in commandline or "--cpu" in time_stats.get("command", "")
         gpu = parse_gpu_usage(run_dir / "gpu_usage.csv", cpu_mode=cpu_mode)
 
-        avg_total = float(tavg.get("total", avg_key(per_frame, "total_ms")))
-        p95_total = percentile([float(item.get("total_ms", 0.0) or 0.0) for item in per_frame], 0.95)
-        eff_fps = 1000.0 / avg_total if avg_total > 1e-9 else 0.0
+        components = [frame_component_ms(item) for item in per_frame]
+        avg_system = avg_key(components, "system_ms")
+        p95_system = percentile([item["system_ms"] for item in components], 0.95)
+        eff_fps = 1000.0 / avg_system if avg_system > 1e-9 else 0.0
 
         rows.append(
             {
                 "game": game,
                 "clip_id": clip_id,
                 "cache_mode": cache_mode,
+                "server_pipeline": "1" if report.get("server_pipeline_enabled", False) or "--server-pipeline 1" in commandline else "0",
+                "server_pipeline_depth": str(int(report.get("server_pipeline_depth", 1) or 1)),
+                "server_post_parallel": "1" if report.get("server_post_parallel_enabled", False) else "0",
                 "frames": str(len(per_frame)),
                 "wall_time": time_stats.get("wall_time", ""),
                 "cpu_pct": time_stats.get("cpu_pct", ""),
@@ -160,16 +198,21 @@ def build_rows() -> list[dict[str, str]]:
                 "system_s": time_stats.get("system_s", ""),
                 "max_rss_mb": time_stats.get("max_rss_mb", ""),
                 **gpu,
-                "avg_total_ms": f"{avg_total:.3f}",
-                "p95_total_ms": f"{p95_total:.3f}",
+                "avg_system_ms": f"{avg_system:.3f}",
+                "p95_system_ms": f"{p95_system:.3f}",
                 "effective_fps": f"{eff_fps:.2f}",
-                "avg_infer_ms": f"{float(tavg.get('infer', avg_key(per_frame, 'infer_ms'))):.3f}",
-                "avg_dict_ms": f"{float(tavg.get('dict', avg_key(per_frame, 'dict_ms'))):.3f}",
-                "avg_paint_ms": f"{float(tavg.get('paint', avg_key(per_frame, 'paint_ms'))):.3f}",
-                "avg_recover_ms": f"{float(tavg.get('recover', avg_key(per_frame, 'recover_ms'))):.3f}",
-                "avg_encode_baseline_ms": f"{avg_key(per_frame, 'encode_baseline_ms'):.3f}",
-                "avg_encode_masked_ms": f"{avg_key(per_frame, 'encode_masked_ms'):.3f}",
-                "avg_stitching_ms": f"{avg_key(per_frame, 'stitching_ms'):.3f}",
+                "path_scope": "RESPAWN-exclusive detect-to-stitch components",
+                "baseline_decode_display_ms": "N/A",
+                "avg_detect_ms": f"{avg_key(components, 'detect_ms'):.3f}",
+                "avg_preprocess_ms": f"{avg_key(components, 'preprocess_ms'):.3f}",
+                "avg_inference_ms": f"{avg_key(components, 'inference_ms'):.3f}",
+                "avg_model_post_ms": f"{avg_key(components, 'model_post_ms'):.3f}",
+                "avg_dict_ms": f"{avg_key(components, 'dict_ms'):.3f}",
+                "avg_masking_ms": f"{avg_key(components, 'masking_ms'):.3f}",
+                "avg_stitching_ms": f"{avg_key(components, 'stitching_ms'):.3f}",
+                "p50_stitching_ms": f"{percentile([item['stitching_ms'] for item in components], 0.50):.3f}",
+                "p95_stitching_ms": f"{percentile([item['stitching_ms'] for item in components], 0.95):.3f}",
+                "avg_wall_total_ms": f"{float(tavg.get('total', avg_key(per_frame, 'total_ms'))):.3f}",
                 "total_detections": str(int(report.get("total_detections", 0) or 0)),
                 "matched_detections": str(int(report.get("matched_detections", 0) or 0)),
                 "avg_ssim_recovered": f"{float(report.get('avg_recovered_ssim', 0.0) or 0.0):.4f}",
@@ -238,7 +281,11 @@ def collect_host_params() -> dict[str, str]:
 
 def write_md(rows: list[dict[str, str]], path: Path, csv_path: Path) -> None:
     host = collect_host_params()
-    enc = json.loads((RESOURCE_RUNS / RUN_ORDER[0][1] / "report.json").read_text()).get("encoder_settings", {})
+    first_report = json.loads((RESOURCE_RUNS / RUN_ORDER[0][1] / "report.json").read_text())
+    enc = first_report.get("encoder_settings", {})
+    pipeline_flag = "1" if first_report.get("server_pipeline_enabled", False) else "0"
+    pipeline_depth = int(first_report.get("server_pipeline_depth", 1) or 1)
+    post_parallel = "1" if first_report.get("server_post_parallel_enabled", False) else "0"
     lines = [
         "# Exp6 Resource and Component Timing Summary",
         "",
@@ -257,6 +304,9 @@ def write_md(rows: list[dict[str, str]], path: Path, csv_path: Path) -> None:
         f"- `max_frames`: 300",
         f"- `encoder`: `{enc.get('enc_codec', 'libx264')}` / CRF `{enc.get('enc_crf', '23')}` / preset `{enc.get('enc_preset', 'medium')}` / tune `{enc.get('enc_tune', 'none')}`",
         f"- `open_gop_defaults`: `{enc.get('enc_open_gop_defaults', True)}`",
+        f"- `server_pipeline`: `{pipeline_flag}`",
+        f"- `server_pipeline_depth`: `{pipeline_depth}`",
+        f"- `server_post_parallel`: `{post_parallel}`",
         f"- `gpu_sampling`: `nvidia-smi` every ~0.5 s",
         "",
         "## Resource Usage",
@@ -283,20 +333,32 @@ def write_md(rows: list[dict[str, str]], path: Path, csv_path: Path) -> None:
 
     lines += [
         "",
-        "## Component Time Cost",
+        "## RESPAWN-Exclusive Processing Cost",
         "",
-        "| Game | Avg total ms | P95 total ms | Eff. FPS | Infer ms | Dict ms | Paint ms | Recover ms | Enc baseline ms | Enc masked ms | Stitch ms |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Game | Avg path ms | P95 path ms | Eff. FPS | Detect ms | Detect prep ms | Detector core ms | Detector post ms | Dict/match ms | Mask/fill ms | Stitch mean ms | Stitch p50 ms | Stitch p95 ms |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for r in rows:
         lines.append(
-            f"| {r['game']} | {r['avg_total_ms']} | {r['p95_total_ms']} | {r['effective_fps']} | {r['avg_infer_ms']} | {r['avg_dict_ms']} | {r['avg_paint_ms']} | {r['avg_recover_ms']} | {r['avg_encode_baseline_ms']} | {r['avg_encode_masked_ms']} | {r['avg_stitching_ms']} |"
+            f"| {r['game']} | {r['avg_system_ms']} | {r['p95_system_ms']} | {r['effective_fps']} | {r['avg_detect_ms']} | {r['avg_preprocess_ms']} | {r['avg_inference_ms']} | {r['avg_model_post_ms']} | {r['avg_dict_ms']} | {r['avg_masking_ms']} | {r['avg_stitching_ms']} | {r['p50_stitching_ms']} | {r['p95_stitching_ms']} |"
         )
 
     lines += [
         "",
+        "## Critical Conclusion",
+        "",
+        "The latency problem after queue-depth and CPU post-processing parallelization is not raw GPU inference. FC5/FM6 detector core time is only about 5 ms/frame, and the inference-worker sweep shows that 2-4 concurrent CUDA sessions do not improve system or wall time; future optimization should target dictionary/template matching, mask/fill, client stitching, memory movement, and removal of benchmark-only encode/quality overhead from the online path.",
+        "",
+        "## Longer-Clip Resource Curve",
+        "",
+        "A 900-frame FM6 run (`record/RESPAWN2026/exp6/resource_curve/fm6_00_900f_w1/resource_curve.md`) records CPU/RSS and GPU telemetry over elapsed time. The average CPU load is 142.1%, while GPU utilization averages 4.3%, reinforcing that the optimized scaffold is CPU/memory and benchmark-overhead limited rather than GPU-inference limited.",
+        "",
         "## Notes",
         "",
+        "- `Avg path` is the sum of RESPAWN-specific measured components from server-side detection through client-side stitching; it is not an end-to-end pipeline time.",
+        "- Common baseline work (video decode, display/frame presentation, and ordinary encode/transport) was not measured in this trace and is reported as N/A rather than folded into RESPAWN modules.",
+        "- `Stitch` is template lookup plus alpha compositing only; it is not total client display time.",
+        "- `Detector post ms` is detector post-processing only; dictionary/template matching is split into `Dict/match ms` to avoid double-counting.",
         "- CPU `%` is process CPU from `/usr/bin/time -v`; values above 100% mean multiple cores were active.",
         "- Max RAM is maximum resident set size from `/usr/bin/time -v`.",
         "- GPU metrics come from periodic `nvidia-smi` sampling during each run.",

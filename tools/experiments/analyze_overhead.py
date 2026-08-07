@@ -6,6 +6,7 @@ import csv
 import hashlib
 import json
 import random
+import shlex
 from collections import Counter, OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,16 +45,39 @@ def load_template_sizes(run_dir: Path, report: dict[str, Any]) -> dict[str, int]
     if dict_dir.exists():
         for path in dict_dir.iterdir():
             if path.is_file():
-                sizes[path.name] = path.stat().st_size
-                sizes[str(path)] = path.stat().st_size
+                size = path.stat().st_size
+                sizes[path.name] = size
+                sizes[str(path)] = size
+                if path.stem.isdigit():
+                    sizes[f"id:{int(path.stem)}"] = size
     latent_path = report.get("latent_bank_path", None)
+    if not latent_path:
+        # Saved CRF23 reports predate the explicit latent_bank_path field, but
+        # preserve the exact command line used for the run.
+        commandline = str(report.get("commandline", "") or "")
+        try:
+            argv = shlex.split(commandline)
+            if "--latent-bank" in argv:
+                idx = argv.index("--latent-bank")
+                if idx + 1 < len(argv):
+                    latent_path = argv[idx + 1]
+        except ValueError:
+            latent_path = None
     if latent_path:
-        latent_bank = json.loads(Path(latent_path).read_text())
-        for item in latent_bank:
-            path = item.get("path", "")
-            if path and Path(path).exists():
-                sizes[path] = Path(path).stat().st_size
-                sizes[Path(path).name] = Path(path).stat().st_size
+        bank_path = Path(latent_path)
+        if bank_path.exists():
+            latent_bank = json.loads(bank_path.read_text())
+            for item in latent_bank:
+                path = Path(str(item.get("path", "") or ""))
+                if not path.is_absolute():
+                    path = bank_path.parent / path
+                if path.exists():
+                    size = path.stat().st_size
+                    sizes[str(path)] = size
+                    sizes[path.name] = size
+                    template_id = int(item.get("id", 0) or 0)
+                    if template_id > 0:
+                        sizes[f"id:{template_id}"] = size
     return sizes
 
 
@@ -89,7 +113,14 @@ def active_template_ids(
             for region_idx, region in enumerate(payload.regions)
         ]
     else:
-        ids = [region.path for region in payload.regions if region.path]
+        ids = []
+        for region in payload.regions:
+            # Pixel-grid records retain an exact template path; learned-path
+            # records intentionally clear it and use the stable numeric ID.
+            if region.path:
+                ids.append(region.path)
+            elif int(region.region_id) > 0:
+                ids.append(f"id:{int(region.region_id)}")
 
     # Preserve order while avoiding duplicate charges for repeated regions in a frame.
     return list(dict.fromkeys(tpl for tpl in ids if tpl))
@@ -98,7 +129,11 @@ def active_template_ids(
 def template_size_for(template_id: str, template_sizes: dict[str, int], synthetic_config: SyntheticTemplateConfig | None) -> int:
     if synthetic_config is not None and synthetic_config.enabled:
         return int(synthetic_config.template_size_bytes)
-    return int(template_sizes.get(template_id) or template_sizes.get(Path(template_id).name, 0))
+    known = template_sizes.get(template_id) or template_sizes.get(Path(template_id).name, 0)
+    if known:
+        return int(known)
+    path = Path(template_id)
+    return int(path.stat().st_size) if path.exists() and path.is_file() else 0
 
 
 def rank_templates_for_preload(
@@ -265,7 +300,11 @@ def simulate_cache(
 
 
 def payloads_have_template_paths(payloads: list[Any]) -> bool:
-    return any(region.path for payload in payloads for region in payload.regions)
+    return any(
+        int(region.region_id) > 0 or bool(region.path)
+        for payload in payloads
+        for region in payload.regions
+    )
 
 
 def parse_cumulative_label(label: str) -> tuple[str, float, int]:
@@ -332,9 +371,9 @@ def main() -> None:
     ap.add_argument("--rd-dir", type=Path, default=RESPAWN2026_DIR / "exp1")
     ap.add_argument("--rd-points", type=Path, default=RESPAWN2026_DIR / "exp1" / "rd_suite_points.csv")
     ap.add_argument("--manifest", type=Path, default=RESPAWN2026_DIR / "manifest" / "offline_manifest.json")
-    ap.add_argument("--out-dir", type=Path, default=RESPAWN2026_DIR / "exp3")
+    ap.add_argument("--out-dir", type=Path, default=RESPAWN2026_DIR / "exp2")
     ap.add_argument("--rtt-ms", nargs="+", type=float, default=[20.0, 80.0, 150.0])
-    ap.add_argument("--delay-rtts", nargs="+", type=int, default=[0, 2, 5])
+    ap.add_argument("--delay-rtts", nargs="+", type=int, default=[0, 1, 2, 3, 4, 5])
     ap.add_argument("--cache-mb", nargs="+", type=float, default=[16.0, 32.0, 64.0, 128.0])
     ap.add_argument("--preload-frac", nargs="+", type=float, default=[0.0, 0.10, 0.25, 0.50, 0.75, 1.0])
     ap.add_argument("--synthetic-template-model", action="store_true", help="Use synthetic template IDs from region boxes when MSK1 paths are missing.")
@@ -456,7 +495,7 @@ def main() -> None:
                             "rtt_ms": rtt,
                             "delay_rtts": delay_rtts,
                             "cache_budget_mb": "" if no_budget is None else (no_budget / (1024.0 * 1024.0)),
-                            "template_model": "synthetic" if synthetic_config.enabled else "payload_path",
+                            "template_model": "synthetic" if synthetic_config.enabled else "measured_payload_identity",
                             "synthetic_template_size_bytes": synthetic_config.template_size_bytes if synthetic_config.enabled else "",
                             "synthetic_reuse_prob": synthetic_config.reuse_prob if synthetic_config.enabled else "",
                             "synthetic_cache_hit_prob": synthetic_config.cache_hit_prob if synthetic_config.enabled else "",
@@ -510,7 +549,7 @@ def main() -> None:
                         "rtt_ms": 20.0,
                         "delay_rtts": 1,
                         "cache_budget_mb": cache_mb,
-                        "template_model": "synthetic" if synthetic_config.enabled else "payload_path",
+                        "template_model": "synthetic" if synthetic_config.enabled else "measured_payload_identity",
                         "synthetic_template_size_bytes": synthetic_config.template_size_bytes if synthetic_config.enabled else "",
                         "synthetic_reuse_prob": synthetic_config.reuse_prob if synthetic_config.enabled else "",
                         "synthetic_cache_hit_prob": synthetic_config.cache_hit_prob if synthetic_config.enabled else "",
@@ -573,7 +612,7 @@ def main() -> None:
                         "preload_fraction": frac,
                         "preloaded_templates": result["preloaded_templates"],
                         "ranked_templates_total": len(ranked_templates),
-                        "template_model": "synthetic" if synthetic_config.enabled else "payload_path",
+                        "template_model": "synthetic" if synthetic_config.enabled else "measured_payload_identity",
                         "synthetic_template_size_bytes": synthetic_config.template_size_bytes if synthetic_config.enabled else "",
                         "synthetic_reuse_prob": synthetic_config.reuse_prob if synthetic_config.enabled else "",
                         "synthetic_cache_hit_prob": synthetic_config.cache_hit_prob if synthetic_config.enabled else "",

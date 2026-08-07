@@ -55,6 +55,16 @@ struct OfflineOptions {
     bool yoloLatentKey = false; // YOLO offline simulator: assign template_id via maskCoeff embedding, no hashing on client
     float latentCosineThreshold = 0.95f; // cosine similarity threshold to reuse template_id
 
+    // Opt-in semantic multipart mode (disabled by default). All valid detections
+    // of multipartClass in a frame are represented as one compound object:
+    // union bbox, alpha-union with transparent gaps, and one latent/MSK1 region.
+    // The merged latent is an area-weighted sum of normalized child maskCoeff
+    // vectors, normalized again; the model has no independent masked-ROI encoder.
+    bool multipartObject = false;
+    int multipartClass = 0;             // spaceflight cockpit class
+    int multipartMinComponents = 2;     // leave singleton detections unchanged
+    float multipartGeometryTolerance = 0.12f; // normalized child-geometry RMS gate
+
     // Build-index mode: prefill template pool (dict + latent_bank.json) from the original stream.
     // This simulates an offline/first-pass server analysis to populate a stable pool before enabling heal-only.
     bool buildIndexOnly = false;
@@ -198,6 +208,14 @@ struct OfflineOptions {
     bool pixelGridHeader = false;    // encode repeated pixel templates as MSK1 v5 grid row-runs
     int pixelGridSnapTolPx = 12;     // max bbox-to-grid snap error for grouping
     int pixelGridMinRun = 2;         // minimum consecutive cells to prefer grid metadata over regions
+
+    // Server latency experiment: overlap YOLO inference for frame N+1 with
+    // dictionary/masking/recovery/encode work for frame N. Pixel mode remains
+    // synchronous because its tracker state depends on the previous frame.
+    bool serverPipeline = false;
+    int serverPipelineDepth = 2;
+    int serverInferWorkers = 1;
+    bool serverPostParallel = false;
 };
 
 struct DictItem {

@@ -2,15 +2,21 @@
 
 Reference arm: Pure streaming
 
+## Exp1 refresh (May 2026)
+
+- Mario uses the 50×44 `brick_large_brown.png` template with pixel-sweep winner `p90_b15_f1_k0.80_og1`.
+- FC5 uses the selected gop_analysis mask profile under the fixed 8–24 Mbps VBV RD protocol.
+- Mario sweep winner did not meet VMAF≥55 at the 16 Mbps anchor; Exp1 uses a multi-rate sweep instead.
+
 The compact table below reports mean equal-quality bitrate reduction and BD-Rate for each game.
 
 ## FC5
 
 | Metric | Equal-quality bitrate reduction | BD-Rate (RESPAWN vs reference) |
 | --- | --- | ---: |
-| VMAF | 86: -81.39%, 85: -70.85%, 84: -61.81% | 61.07% |
-| SSIM | 0.965: -127.22%, 0.964: -124.32%, 0.963: -114.97% | 133.06% |
-| PSNR | 37.8: -207.03% | 206.66% |
+| VMAF | 78: -132.79%, 77: -127.76%, 76: -109.38% | 92.17% |
+| SSIM |  |  |
+| PSNR |  |  |
 
 ## FM6
 

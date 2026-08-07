@@ -98,8 +98,8 @@ def run_vmaf(
 
     if frame_cnt is not None and frame_cnt > 0:
         cmd.extend(["--frame_cnt", str(int(frame_cnt))])
-    if subsample is not None and subsample > 1:
-        cmd.extend(["--subsample", str(int(subsample))])
+    # ffmpeg_to_y4m already selected every Nth frame. Passing --subsample to
+    # libvmaf as well would apply the stride twice (effective N^2 sampling).
 
     env = os.environ.copy()
     # Ensure libvmaf shared library is discoverable (install uses lib/x86_64-linux-gnu).

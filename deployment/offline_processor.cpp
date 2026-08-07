@@ -17,6 +17,13 @@
 #include <sstream>
 #include <csignal>
 #include <climits>
+#include <future>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
+#include <map>
+#include <exception>
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -504,6 +511,109 @@ static std::array<float, 32> l2_normalize_32(const std::array<float, 32> &v) {
     std::array<float, 32> out{};
     for (size_t i = 0; i < 32; ++i) out[i] = (float)(v[i] * inv);
     return out;
+}
+
+static std::vector<cv::Rect2f> normalized_component_geometry(const DL_RESULT &d) {
+    std::vector<cv::Rect> boxes = d.componentBoxes;
+    if (boxes.empty() && d.box.area() > 0) boxes.push_back(d.box);
+    std::vector<cv::Rect2f> out;
+    if (d.box.width <= 0 || d.box.height <= 0) return out;
+    out.reserve(boxes.size());
+    for (const auto &b : boxes) {
+        out.emplace_back(
+            (float)(b.x - d.box.x) / (float)d.box.width,
+            (float)(b.y - d.box.y) / (float)d.box.height,
+            (float)b.width / (float)d.box.width,
+            (float)b.height / (float)d.box.height);
+    }
+    std::sort(out.begin(), out.end(), [](const cv::Rect2f &a, const cv::Rect2f &b) {
+        if (a.x != b.x) return a.x < b.x;
+        if (a.y != b.y) return a.y < b.y;
+        if (a.width != b.width) return a.width < b.width;
+        return a.height < b.height;
+    });
+    return out;
+}
+
+static bool component_geometry_compatible(const std::vector<cv::Rect2f> &a,
+                                          const std::vector<cv::Rect2f> &b,
+                                          float tolerance) {
+    // Old banks have no component geometry and remain valid for singleton/default
+    // operation, but cannot safely match a newly merged multipart query.
+    if (a.empty() || b.empty()) {
+        const size_t known_size = a.empty() ? b.size() : a.size();
+        return known_size <= 1;
+    }
+    if (a.size() != b.size()) return false;
+    double sum2 = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        const float av[4] = {a[i].x, a[i].y, a[i].width, a[i].height};
+        const float bv[4] = {b[i].x, b[i].y, b[i].width, b[i].height};
+        for (int j = 0; j < 4; ++j) {
+            double delta = (double)av[j] - (double)bv[j];
+            sum2 += delta * delta;
+        }
+    }
+    const double rms = std::sqrt(sum2 / (double)(a.size() * 4));
+    return rms <= std::max(0.0f, tolerance);
+}
+
+static bool merge_multipart_detections(std::vector<DL_RESULT> &dets,
+                                       const OfflineOptions &opt,
+                                       const cv::Size &frame_size,
+                                       int &input_components) {
+    input_components = 0;
+    if (!opt.multipartObject || opt.pixelMode) return false;
+    std::vector<size_t> selected;
+    for (size_t i = 0; i < dets.size(); ++i) {
+        const auto &d = dets[i];
+        if (d.classId == opt.multipartClass && d.confidence >= opt.confThreshold &&
+            d.box.area() > 0 && !d.boxMask.empty()) {
+            selected.push_back(i);
+        }
+    }
+    input_components = (int)selected.size();
+    if ((int)selected.size() < std::max(2, opt.multipartMinComponents)) return false;
+
+    const cv::Rect bounds(0, 0, frame_size.width, frame_size.height);
+    cv::Rect union_box;
+    cv::Mat union_mask = cv::Mat::zeros(frame_size, CV_8UC1);
+    std::array<float, 32> weighted{};
+    double total_weight = 0.0;
+    float confidence = 0.0f;
+    DL_RESULT merged{};
+    merged.classId = opt.multipartClass;
+    for (size_t idx : selected) {
+        const auto &child = dets[idx];
+        const cv::Rect safe = child.box & bounds;
+        if (safe.area() <= 0) continue;
+        union_box = union_box.area() > 0 ? (union_box | safe) : safe;
+        merged.componentBoxes.push_back(safe);
+        confidence = std::max(confidence, child.confidence);
+        cv::Mat child_roi;
+        try { child_roi = child.boxMask(safe); } catch (...) { continue; }
+        if (child_roi.empty()) continue;
+        cv::bitwise_or(union_mask(safe), child_roi, union_mask(safe));
+        const double weight = (double)std::max(1, cv::countNonZero(child_roi));
+        const auto child_emb = l2_normalize_32(child.maskCoeff);
+        for (size_t k = 0; k < weighted.size(); ++k) weighted[k] += (float)(weight * child_emb[k]);
+        total_weight += weight;
+    }
+    if (union_box.area() <= 0 || total_weight <= 0.0) return false;
+    merged.box = union_box;
+    merged.boxMask = std::move(union_mask);
+    merged.confidence = confidence;
+    merged.maskCoeff = l2_normalize_32(weighted);
+
+    std::vector<DL_RESULT> out;
+    out.reserve(dets.size() - selected.size() + 1);
+    std::unordered_set<size_t> selected_set(selected.begin(), selected.end());
+    for (size_t i = 0; i < dets.size(); ++i) {
+        if (selected_set.find(i) == selected_set.end()) out.push_back(std::move(dets[i]));
+    }
+    out.push_back(std::move(merged));
+    dets = std::move(out);
+    return true;
 }
 
 static float cosine_sim_32(const std::array<float, 32> &a, const std::array<float, 32> &b) {
@@ -2238,7 +2348,8 @@ static void apply_fill_with_feather_bbox(
     const cv::Mat &fill_bgr,
     const cv::Mat &mask_full_u8,
     const cv::Rect &bbox,
-    int feather_px
+    int feather_px,
+    bool use_parallel = false
 ) {
     if (dst_bgr.empty() || orig_bgr.empty() || fill_bgr.empty() || mask_full_u8.empty()) return;
     if (dst_bgr.type() != CV_8UC3 || orig_bgr.type() != CV_8UC3 || fill_bgr.type() != CV_8UC3) return;
@@ -2253,7 +2364,8 @@ static void apply_fill_with_feather_bbox(
 
     // No feather: direct copy from fill for masked pixels.
     if (feather_px <= 0) {
-        for (int y = safe.y; y < safe.y + safe.height; ++y) {
+        auto apply_rows = [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y) {
             const uchar *mrow = mask_full_u8.ptr<uchar>(y);
             const cv::Vec3b *frow = fill_bgr.ptr<cv::Vec3b>(y);
             cv::Vec3b *drow = dst_bgr.ptr<cv::Vec3b>(y);
@@ -2261,6 +2373,14 @@ static void apply_fill_with_feather_bbox(
                 if (mrow[x] == 0) continue;
                 drow[x] = frow[x];
             }
+        }
+        };
+        if (use_parallel && safe.height >= 32) {
+            cv::parallel_for_(cv::Range(safe.y, safe.y + safe.height), [&](const cv::Range &r) {
+                apply_rows(r.start, r.end);
+            });
+        } else {
+            apply_rows(safe.y, safe.y + safe.height);
         }
         return;
     }
@@ -2273,7 +2393,8 @@ static void apply_fill_with_feather_bbox(
     cv::distanceTransform(bin, dist, cv::DIST_L2, 3);
 
     const float inv = 1.0f / (float)std::max(1, feather_px);
-    for (int yy = 0; yy < safe.height; ++yy) {
+    auto apply_rows = [&](int yy0, int yy1) {
+    for (int yy = yy0; yy < yy1; ++yy) {
         int y = safe.y + yy;
         const uchar *mrow = mask_full_u8.ptr<uchar>(y);
         const cv::Vec3b *orow = orig_bgr.ptr<cv::Vec3b>(y);
@@ -2300,6 +2421,14 @@ static void apply_fill_with_feather_bbox(
             }
         }
     }
+    };
+    if (use_parallel && safe.height >= 32) {
+        cv::parallel_for_(cv::Range(0, safe.height), [&](const cv::Range &r) {
+            apply_rows(r.start, r.end);
+        });
+    } else {
+        apply_rows(0, safe.height);
+    }
 }
 
 static void apply_flat_color_with_feather_bbox(
@@ -2308,7 +2437,8 @@ static void apply_flat_color_with_feather_bbox(
     const cv::Vec3b &fill_color,
     const cv::Mat &mask_full_u8,
     const cv::Rect &bbox,
-    int feather_px
+    int feather_px,
+    bool use_parallel = false
 ) {
     if (dst_bgr.empty() || orig_bgr.empty() || mask_full_u8.empty()) return;
     if (dst_bgr.type() != CV_8UC3 || orig_bgr.type() != CV_8UC3 || mask_full_u8.type() != CV_8UC1) return;
@@ -2321,13 +2451,22 @@ static void apply_flat_color_with_feather_bbox(
     if (cv::countNonZero(mroi) == 0) return;
 
     if (feather_px <= 0) {
-        for (int y = safe.y; y < safe.y + safe.height; ++y) {
+        auto apply_rows = [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y) {
             const uchar *mrow = mask_full_u8.ptr<uchar>(y);
             cv::Vec3b *drow = dst_bgr.ptr<cv::Vec3b>(y);
             for (int x = safe.x; x < safe.x + safe.width; ++x) {
                 if (mrow[x] == 0) continue;
                 drow[x] = fill_color;
             }
+        }
+        };
+        if (use_parallel && safe.height >= 32) {
+            cv::parallel_for_(cv::Range(safe.y, safe.y + safe.height), [&](const cv::Range &r) {
+                apply_rows(r.start, r.end);
+            });
+        } else {
+            apply_rows(safe.y, safe.y + safe.height);
         }
         return;
     }
@@ -2338,7 +2477,8 @@ static void apply_flat_color_with_feather_bbox(
     cv::distanceTransform(bin, dist, cv::DIST_L2, 3);
 
     const float inv = 1.0f / (float)std::max(1, feather_px);
-    for (int yy = 0; yy < safe.height; ++yy) {
+    auto apply_rows = [&](int yy0, int yy1) {
+    for (int yy = yy0; yy < yy1; ++yy) {
         int y = safe.y + yy;
         const uchar *mrow = mask_full_u8.ptr<uchar>(y);
         const cv::Vec3b *orow = orig_bgr.ptr<cv::Vec3b>(y);
@@ -2362,6 +2502,14 @@ static void apply_flat_color_with_feather_bbox(
                 drow[x] = out;
             }
         }
+    }
+    };
+    if (use_parallel && safe.height >= 32) {
+        cv::parallel_for_(cv::Range(0, safe.height), [&](const cv::Range &r) {
+            apply_rows(r.start, r.end);
+        });
+    } else {
+        apply_rows(0, safe.height);
     }
 }
 
@@ -2768,6 +2916,11 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
     std::vector<double> t_masked_bbox_pct, t_masked_alpha_pct;
     std::vector<int> t_changed_pixels;
     std::vector<double> t_changed_pixels_pct;
+    std::vector<int> t_msk1_payload_bytes, t_multipart_input_components, t_multipart_output_regions;
+    uint64_t multipart_merged_frames = 0;
+    uint64_t multipart_input_components = 0;
+    uint64_t multipart_output_regions = 0;
+    uint64_t msk1_payload_bytes_total = 0;
 
     // Optional latent dump (for threshold sweep experiments)
     std::ofstream latOut;
@@ -2839,6 +2992,7 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
         uint64_t use_count{0}; // how many times selected for this run (server-side)
         int minted_frame{-1};
         int last_used_frame{-1};
+        std::vector<cv::Rect2f> component_geometry;
     };
     std::vector<LatentTpl> latent_bank;
     std::unordered_map<uint32_t, size_t> latent_id_to_index;
@@ -2871,6 +3025,14 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                 } else {
                     continue; // invalid
                 }
+                if (it.contains("component_geometry") && it["component_geometry"].is_array()) {
+                    for (const auto &g : it["component_geometry"]) {
+                        if (!g.is_array() || g.size() != 4) continue;
+                        t.component_geometry.emplace_back(
+                            g[0].get<float>(), g[1].get<float>(),
+                            g[2].get<float>(), g[3].get<float>());
+                    }
+                }
                 if (t.id == 0 || t.wh.width <= 0 || t.wh.height <= 0 || t.path.empty()) continue;
                 latent_id_to_index[t.id] = latent_bank.size();
                 latent_bank.push_back(std::move(t));
@@ -2897,6 +3059,7 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
         cv::Rect box;
         uint32_t id{0};
         std::array<float, 32> emb_norm{};
+        std::vector<cv::Rect2f> component_geometry;
         bool valid{false};
     };
     // Multi-instance support: maintain multiple "last" entries per class to avoid mixing
@@ -2944,8 +3107,128 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
     cv::Vec3b dominant_bgr(0, 255, 0);
     cv::Mat bg_ema_f32;
     bool bg_ema_inited = false;
-    while (cap.read(frame)) {
-        if (opt.maxFrames > 0 && frameIdx >= opt.maxFrames) break;
+
+    struct AsyncYoloResult {
+        int frameIdx{0};
+        cv::Mat frame;
+        std::vector<DL_RESULT> dets;
+        bool ok{false};
+        double infer_ms{0.0};
+        double preprocess_ms{0.0};
+        double inference_ms{0.0};
+        double postprocess_ms{0.0};
+    };
+    const bool use_server_pipeline = opt.serverPipeline && !opt.pixelMode;
+    const size_t server_pipeline_depth = (size_t)std::max(1, opt.serverPipelineDepth);
+    const int server_infer_workers = use_server_pipeline ? std::max(1, opt.serverInferWorkers) : 1;
+    std::map<int, AsyncYoloResult> yoloResults;
+    std::mutex yoloMutex;
+    std::condition_variable yoloResultCv;
+    std::condition_variable yoloSpaceCv;
+    int yoloNextInputFrameIdx = 0;
+    int yoloNextOutputFrameIdx = 0;
+    int yoloWorkersDone = 0;
+    std::exception_ptr yoloWorkerError;
+    bool yoloFatalError = false;
+    std::vector<std::thread> yoloWorkers;
+    if (use_server_pipeline) {
+        yoloWorkers.reserve((size_t)server_infer_workers);
+        for (int workerId = 0; workerId < server_infer_workers; ++workerId) {
+            yoloWorkers.emplace_back([&, workerId]() {
+                YOLO_V8 localDetector;
+                YOLO_V8 *detector = &yoloDetector;
+                try {
+                    if (workerId > 0) {
+                        DL_INIT_PARAM params;
+                        params.modelPath = opt.model;
+                        params.modelType = YOLO_SEG_V12;
+                        params.imgSize = {640, 640};
+                        params.rectConfidenceThreshold = opt.confThreshold;
+                        params.iouThreshold = 0.5;
+                        params.maskConfidenceThreshold = opt.maskThreshold;
+                        params.cudaEnable = opt.useCuda;
+                        if (localDetector.CreateSession(params) != RET_OK) {
+                            throw std::runtime_error("Failed to initialize worker YOLO session");
+                        }
+                        detector = &localDetector;
+                    }
+                while (true) {
+                    int idx = 0;
+                    cv::Mat nextFrame;
+                    {
+                        std::unique_lock<std::mutex> lk(yoloMutex);
+                        yoloSpaceCv.wait(lk, [&]() {
+                            return yoloWorkerError ||
+                                   (size_t)(yoloNextInputFrameIdx - yoloNextOutputFrameIdx) < server_pipeline_depth;
+                        });
+                        if (yoloWorkerError) break;
+                        if (opt.maxFrames > 0 && yoloNextInputFrameIdx >= opt.maxFrames) break;
+                        if (!cap.read(nextFrame)) break;
+                        idx = yoloNextInputFrameIdx++;
+                    }
+                    AsyncYoloResult result;
+                    result.frameIdx = idx;
+                    result.frame = nextFrame;
+                    auto t0 = std::chrono::steady_clock::now();
+                    result.ok = (detector->RunSession(result.frame, result.dets) == RET_OK);
+                    auto t1 = std::chrono::steady_clock::now();
+                    result.infer_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+                    result.preprocess_ms = detector->LastPreprocessMs();
+                    result.inference_ms = detector->LastInferMs();
+                    result.postprocess_ms = detector->LastPostprocessMs();
+                    {
+                        std::lock_guard<std::mutex> lk(yoloMutex);
+                        yoloResults.emplace(result.frameIdx, std::move(result));
+                    }
+                    yoloResultCv.notify_one();
+                }
+            } catch (...) {
+                    std::lock_guard<std::mutex> lk(yoloMutex);
+                    if (!yoloWorkerError) yoloWorkerError = std::current_exception();
+            }
+            {
+                    std::lock_guard<std::mutex> lk(yoloMutex);
+                    yoloWorkersDone++;
+            }
+                yoloResultCv.notify_all();
+                yoloSpaceCv.notify_all();
+            });
+        }
+        std::cout << "[ServerPipeline] enabled: depth=" << server_pipeline_depth
+                  << " inferWorkers=" << server_infer_workers
+                  << " (ordered result queue)\n";
+    }
+
+    while (true) {
+        AsyncYoloResult asyncYolo;
+        bool haveAsyncYolo = false;
+        if (use_server_pipeline) {
+            {
+                std::unique_lock<std::mutex> lk(yoloMutex);
+                yoloResultCv.wait(lk, [&]() {
+                    return yoloWorkerError ||
+                           yoloResults.find(yoloNextOutputFrameIdx) != yoloResults.end() ||
+                           yoloWorkersDone == server_infer_workers;
+                });
+                if (yoloWorkerError) {
+                    yoloFatalError = true;
+                    break;
+                }
+                auto it = yoloResults.find(yoloNextOutputFrameIdx);
+                if (it == yoloResults.end()) break;
+                asyncYolo = std::move(it->second);
+                yoloResults.erase(it);
+                yoloNextOutputFrameIdx++;
+            }
+            yoloSpaceCv.notify_one();
+            if (yoloFatalError) break;
+            frame = asyncYolo.frame;
+            frameIdx = asyncYolo.frameIdx;
+            haveAsyncYolo = true;
+        } else {
+            if (!cap.read(frame)) break;
+            if (opt.maxFrames > 0 && frameIdx >= opt.maxFrames) break;
+        }
         cv::Mat processed = frame.clone();  // masked view (what server sends)
         cv::Mat recovered;                 // reconstructed client view from masked + side-channel
         double infer_ms = 0.0, paint_ms = 0.0, recover_ms = 0.0, dict_ms = 0.0, frame_total_ms = 0.0;
@@ -2956,6 +3239,9 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
         // Per-frame latent/coverage counters (only meaningful for YOLO mode).
         int frame_latent_minted = 0;
         int frame_latent_reused = 0;
+        int frame_multipart_input_components = 0;
+        int frame_multipart_output_regions = 0;
+        int frame_msk1_payload_bytes = 0;
         uint64_t frame_masked_bbox_px = 0;
         uint64_t frame_masked_alpha_px = 0;
         // Union mask of pixels we decide to modify on the server stream (before feather/composite).
@@ -3160,6 +3446,18 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                         }
                     }
                 }
+            } else if (use_server_pipeline && haveAsyncYolo) {
+                dets = std::move(asyncYolo.dets);
+                if (!asyncYolo.ok) {
+                    std::cerr << "Error running inference on frame " << frameIdx << std::endl;
+                    if (writer.isOpen()) (void)writer.write(processed);
+                    ++frameIdx;
+                    continue;
+                }
+                preprocess_ms = asyncYolo.preprocess_ms;
+                inference_ms = asyncYolo.inference_ms;
+                postprocess_ms = asyncYolo.postprocess_ms;
+                infer_ms = asyncYolo.infer_ms;
             } else {
                 // Use YOLO model as before
                 if (yoloDetector.RunSession(frame, dets) != RET_OK) {
@@ -3174,7 +3472,23 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                 postprocess_ms = yoloDetector.LastPostprocessMs(); // will be augmented by latent/gating work (dict_ms)
             }
             auto t1 = std::chrono::steady_clock::now();
-            infer_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            if (!(use_server_pipeline && haveAsyncYolo)) {
+                infer_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            }
+        }
+
+        // Collapse the targeted semantic object's disconnected detections before
+        // latent dumping, minting, masking, and MSK1 construction. This guarantees
+        // that bank build and lookup use exactly the same merged representation.
+        if (!opt.pixelMode) {
+            const bool merged = merge_multipart_detections(
+                dets, opt, frame.size(), frame_multipart_input_components);
+            if (merged) {
+                frame_multipart_output_regions = 1;
+                multipart_merged_frames++;
+                multipart_input_components += (uint64_t)frame_multipart_input_components;
+                multipart_output_regions++;
+            }
         }
 
         // Dump raw per-frame latent embeddings (YOLO only; independent of the reuse threshold).
@@ -3195,7 +3509,7 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                     if (i) latOut << ",";
                     latOut << emb[(size_t)i];
                 }
-                latOut << "]}\n";
+                latOut << "],\"multipart_components\":" << d.componentBoxes.size() << "}\n";
             }
         }
 
@@ -3315,6 +3629,7 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
 
                     // Normalize embedding
                     std::array<float, 32> emb = l2_normalize_32(d.maskCoeff);
+                    const auto component_geometry = normalized_component_geometry(d);
 
                     // Hybrid sampling: base periodic mint + motion-triggered boost
                     bool force_mint = false;
@@ -3331,16 +3646,25 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                         // compare against best-overlap instance for this class
                         float best_iou = 0.0f;
                         cv::Rect best_box;
+                        std::vector<cv::Rect2f> best_geometry;
                         bool found = false;
                         for (const auto &ll : itLastVec0->second) {
                             if (!ll.valid) continue;
                             float iou = iou_rect(ll.box, safeBox);
-                            if (iou > best_iou) { best_iou = iou; best_box = ll.box; found = true; }
+                            if (iou > best_iou) {
+                                best_iou = iou;
+                                best_box = ll.box;
+                                best_geometry = ll.component_geometry;
+                                found = true;
+                            }
                         }
                         if (found) {
                             float cdist = center_dist_px(best_box, safeBox);
                             float ad = area_ratio_delta(best_box, safeBox);
-                            if (best_iou < opt.latentMotionIouThr || cdist > opt.latentMotionCenterPx || ad > opt.latentMotionScaleThr) {
+                            const bool geometry_drift = !component_geometry_compatible(
+                                component_geometry, best_geometry, opt.multipartGeometryTolerance);
+                            if (best_iou < opt.latentMotionIouThr || cdist > opt.latentMotionCenterPx ||
+                                ad > opt.latentMotionScaleThr || geometry_drift) {
                             latent_boost_until_frame[d.classId] = frameIdx + std::max(0, opt.latentMotionBoostFrames);
                             latent_motion_boost_events++;
                         }
@@ -3365,6 +3689,9 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                         for (size_t li = 0; li < itLastVec->second.size(); ++li) {
                             const auto &ll = itLastVec->second[li];
                             if (!ll.valid) continue;
+                            if (!component_geometry_compatible(
+                                    component_geometry, ll.component_geometry,
+                                    opt.multipartGeometryTolerance)) continue;
                             float iou = iou_rect(ll.box, safeBox);
                             if (iou > best_iou) { best_iou = iou; best_idx = li; found = true; }
                         }
@@ -3387,6 +3714,9 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                         auto t_search0 = std::chrono::steady_clock::now();
                         for (const auto &tpl : latent_bank) {
                             if (tpl.cls != d.classId) continue;
+                            if (!component_geometry_compatible(
+                                    component_geometry, tpl.component_geometry,
+                                    opt.multipartGeometryTolerance)) continue;
                             // Heal-only: allow size mismatch (we can resize the template) and rely on spill checks.
                             if (!opt.yoloHealOnly) {
                                 if (std::abs(tpl.wh.width - safeBox.width) > 2 || std::abs(tpl.wh.height - safeBox.height) > 2) continue;
@@ -3480,6 +3810,9 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                             cands.reserve(8);
                             for (const auto &tpl : latent_bank) {
                                 if (tpl.cls != d.classId) continue;
+                                if (!component_geometry_compatible(
+                                        component_geometry, tpl.component_geometry,
+                                        opt.multipartGeometryTolerance)) continue;
                                 if (!opt.yoloHealOnly) {
                                     if (std::abs(tpl.wh.width - safeBox.width) > 2 || std::abs(tpl.wh.height - safeBox.height) > 2) continue;
                                 }
@@ -3507,6 +3840,9 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                             const float minSim = is_gop_i ? opt.yoloHealFallbackMinSimI : opt.yoloHealFallbackMinSim;
                             for (const auto &tpl : latent_bank) {
                                 if (tpl.cls != d.classId) continue;
+                                if (!component_geometry_compatible(
+                                        component_geometry, tpl.component_geometry,
+                                        opt.multipartGeometryTolerance)) continue;
                                 if (tpl.last_used_frame < 0) continue;
                                 if ((frameIdx - tpl.last_used_frame) > win) continue;
                                 float sim = cosine_sim_32(emb, tpl.emb_norm);
@@ -3568,6 +3904,7 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                         tpl.use_count = 1;
                         tpl.minted_frame = frameIdx;
                         tpl.last_used_frame = frameIdx;
+                        tpl.component_geometry = component_geometry;
                         latent_id_to_index[tpl.id] = latent_bank.size();
                         latent_bank.push_back(std::move(tpl));
                         latent_minted++;
@@ -3612,6 +3949,7 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                         ll.box = safeBox;
                         ll.id = chosen_id;
                         ll.emb_norm = emb;
+                        ll.component_geometry = component_geometry;
                         ll.valid = true;
                         if (best_idx != (size_t)-1 && best_iou >= 0.3f) {
                             vec[best_idx] = std::move(ll);
@@ -3858,9 +4196,9 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                     cv::Rect box = (di < det_stitch_boxes.size() && det_stitch_boxes[di].area() > 0) ? det_stitch_boxes[di] : dets[di].box;
                     if (per_region_flat_color) {
                         cv::Vec3b region_color = dominant_color_bgr_hist_region(frame, dets[di], opt.maskColorLocalPadPx, dominant_bgr, opt.maskColorLocalStat);
-                        apply_flat_color_with_feather_bbox(processed, frame, region_color, mask_union_u8, box, opt.featherPx);
+                        apply_flat_color_with_feather_bbox(processed, frame, region_color, mask_union_u8, box, opt.featherPx, opt.serverPostParallel);
                     } else {
-                        apply_fill_with_feather_bbox(processed, frame, fill_bgr, mask_union_u8, box, opt.featherPx);
+                        apply_fill_with_feather_bbox(processed, frame, fill_bgr, mask_union_u8, box, opt.featherPx, opt.serverPostParallel);
                     }
                 }
             }
@@ -4066,6 +4404,8 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
             uint16_t msk1_version = (opt.pixelMode && opt.pixelGridHeader) ? 5 : 4;
             std::vector<uint8_t> payload = build_msk1_payload((uint64_t)frameIdx, pts, sei_regions, msk1_version, frame_flags, pixel_grid_groups);
             uint32_t len = (uint32_t)payload.size();
+            frame_msk1_payload_bytes = (int)len;
+            msk1_payload_bytes_total += (uint64_t)len;
             seiOut.write(reinterpret_cast<const char*>(&len), sizeof(len));
             if (len) seiOut.write(reinterpret_cast<const char*>(payload.data()), len);
             auto t_sei1 = std::chrono::steady_clock::now();
@@ -4154,6 +4494,9 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
         t_frame_flags_raw.push_back(frame_flags_raw_i);
         t_latent_minted_regions.push_back(frame_latent_minted);
         t_latent_reused_regions.push_back(frame_latent_reused);
+        t_msk1_payload_bytes.push_back(frame_msk1_payload_bytes);
+        t_multipart_input_components.push_back(frame_multipart_input_components);
+        t_multipart_output_regions.push_back(frame_multipart_output_regions);
         double frame_px = (double)std::max<int64_t>(1, (int64_t)frame.cols * (int64_t)frame.rows);
         t_masked_bbox_pct.push_back(100.0 * (double)frame_masked_bbox_px / frame_px);
         t_masked_alpha_pct.push_back(100.0 * (double)frame_masked_alpha_px / frame_px);
@@ -4212,6 +4555,15 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
         if (frameIdx % 200 == 0) {
             std::cout << "Processed " << frameIdx << "/" << cap.get(cv::CAP_PROP_FRAME_COUNT) << " frames." << std::endl;
         }
+    }
+
+    for (auto &worker : yoloWorkers) {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+    if (yoloWorkerError) {
+        std::rethrow_exception(yoloWorkerError);
     }
 
     // Save updated dictionary index only for traditional (YOLO) mode
@@ -4287,7 +4639,26 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
     report["yolo_matcher"] = yolo_matcher;
     report["matcher_new_templates"] = matcher_new_templates;
     report["matcher_id_switches"] = matcher_id_switches;
+    report["multipart_object"] = {
+        {"enabled", opt.multipartObject},
+        {"class_id", opt.multipartClass},
+        {"min_components", opt.multipartMinComponents},
+        {"geometry_tolerance", opt.multipartGeometryTolerance},
+        {"embedding", "area_weighted_l2_normalized_child_mask_coefficients"},
+        {"merged_frames", multipart_merged_frames},
+        {"input_components", multipart_input_components},
+        {"output_regions", multipart_output_regions}
+    };
+    report["msk1_payload_bytes_total"] = msk1_payload_bytes_total;
+    report["msk1_payload_bytes_per_frame"] =
+        frameIdx > 0 ? (double)msk1_payload_bytes_total / (double)frameIdx : 0.0;
+    report["msk1_payload_bitrate_bps"] =
+        frameIdx > 0 ? (double)msk1_payload_bytes_total * 8.0 * fps / (double)frameIdx : 0.0;
     report["timing_enabled"] = opt.recordTiming;
+    report["server_pipeline_enabled"] = opt.serverPipeline;
+    report["server_pipeline_depth"] = opt.serverPipelineDepth;
+    report["server_infer_workers"] = opt.serverInferWorkers;
+    report["server_post_parallel_enabled"] = opt.serverPostParallel;
     report["frame_mode_hysteresis"] = {
         {"enabled", opt.frameModeHysteresis},
         {"confirm_frames", opt.frameModeHysteresisConfirmFrames},
@@ -4356,6 +4727,10 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
             for (const auto &t : latent_bank) {
                 json e = json::array();
                 for (int i = 0; i < 32; ++i) e.push_back(t.emb_norm[(size_t)i]);
+                json geometry = json::array();
+                for (const auto &g : t.component_geometry) {
+                    geometry.push_back({g.x, g.y, g.width, g.height});
+                }
                 bank.push_back({
                     {"id", t.id},
                     {"cls", t.cls},
@@ -4365,7 +4740,8 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
                     {"path", t.path},
                     {"minted_frame", t.minted_frame},
                     {"last_used_frame", t.last_used_frame},
-                    {"emb", e}
+                    {"emb", e},
+                    {"component_geometry", geometry}
                 });
             }
             fs::path outPath = fs::path(opt.outDir) / "latent_bank.json";
@@ -4453,6 +4829,11 @@ int run_offline_evaluation(const OfflineOptions &opt, YOLO_V8& yoloDetector) {
         if (i < t_changed_pixels.size()) {
             item["changed_pixels"] = t_changed_pixels[i];
             item["changed_pixels_pct"] = t_changed_pixels_pct[i];
+        }
+        if (i < t_msk1_payload_bytes.size()) {
+            item["msk1_payload_bytes"] = t_msk1_payload_bytes[i];
+            item["multipart_input_components"] = t_multipart_input_components[i];
+            item["multipart_output_regions"] = t_multipart_output_regions[i];
         }
         if (i < t_preprocess_ms.size()) {
             item["preprocess_ms"] = t_preprocess_ms[i];

@@ -1,0 +1,422 @@
+% Results source of truth: record/RESPAWN2026/Evaluation.tex.
+% The Experiment Results draft below is retained only for provenance and must
+% not be included together with Evaluation.tex.
+\section{Evaluation Methodology}
+\label{sec:EvaluationMethodology}
+
+We now describe how we measure the costs and benefits of the segment-and-regenerate pipeline introduced in the preceding sections.
+Our evaluation targets three questions: (i)~how much bandwidth does masking save relative to unmodified streaming? (ii)~does client-side reconstruction preserve visual quality? and (iii)~what processing delay does the pipeline add to each frame?
+
+\subsection{Experimental Setup}
+\label{sec:experimentalSetup}
+
+As outlined in \S\ref{sec:offlinePrototype}, we evaluate \sysname using a two-pass offline pipeline built on FFmpeg.
+
+\parab{Server Pass}
+FFmpeg ingests source video from disk and processes each frame through the server pipeline described in \S\ref{sec:server}: object detection via YOLOv12n-seg (or the pixel-game pipeline for 2D titles), latent-key identity matching, reliability-gated masking, and RSEI metadata emission.
+The resulting masked frames are H.264-encoded and written to an output file with per-frame RSEI payloads embedded as SEI.
+In parallel, we encode a \emph{baseline} stream from the same source under identical encoder settings but with masking and SEI disabled.
+
+\parab{Client Pass}
+FFmpeg decodes the masked stream and replays it through the client reconstruction pipeline described in \S\ref{sec:client}.
+For each frame, the client extracts the RSEI, performs template lookup and alpha-blended overlay for \emph{Ref} regions, and writes the reconstructed frame to disk.
+The resulting video represents what an end user would see in a live deployment.
+
+\parab{Instrumentation}
+We instrument both passes to collect fine-grained, per-frame measurements.
+On the server side, we record the encoded size of each masked frame together with its RSEI bytes, and separately time each pipeline stage (YOLO inference, latent-key matching, masking, and SEI insertion).
+On the client side, we record the time for SEI extraction, template lookup, and frame compositing.
+All latencies are reported in milliseconds.
+
+\parab{Rationale for Offline Evaluation}
+Our evaluation deliberately decouples the masking and reconstruction mechanisms from network transport.
+The computational costs, bitrate savings, and visual fidelity impacts of the segment-and-regenerate pipeline are orthogonal to congestion control, adaptive bitrate selection, and packetization, all of which have been studied extensively in prior work~\cite{}.
+The offline setup enables controlled, reproducible measurement of \sysname's core design trade-offs while the real-time system remains under development.
+
+\subsection{Game Selection}
+\label{sec:gameSelection}
+
+We select three titles spanning distinct visual characteristics and recurring-object types to stress different aspects of the pipeline (Table~\ref{tab:Games}).
+
+\begin{table}[t]
+  \centering
+  \small
+  \caption{Games used for evaluation. Each title features a different class of recurring object that exercises a distinct part of the pipeline.}
+  \label{tab:Games}
+  \setlength{\tabcolsep}{4pt}
+  \begin{tabular}{@{}llll@{}}
+    \toprule
+    \textbf{Game} & \textbf{Genre} & \textbf{Type} & \textbf{Recurring Object} \\
+    \midrule
+    FC5 & Shooter & AAA & Weapon model \\
+    FM6 & Racing & AAA & Vehicle interior \\
+    Mario & Platformer & 2D & Character sprite \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Far Cry~5 tests the pipeline under high appearance variability: the weapon shifts in pose, lighting, and partial occlusion across frames, exercising latent-key matching and the reliability gate.
+Forza Motorsport~6 presents a large, geometrically stable object---the vehicle dashboard---that occupies substantial screen area, providing the greatest opportunity for bitrate reduction.
+Super Mario Bros.\ exercises the pixel-game mode (\S\ref{sec:pixelGameMode}), where small, high-contrast sprites require template matching and Kalman-stabilized tracking rather than neural segmentation.
+
+\subsection{Metrics}
+\label{sec:metrics}
+
+We evaluate \sysname along three dimensions: bandwidth savings, reconstruction quality, and processing delay.
+Because RESPAWN trades video bytes for metadata and client-side reconstruction, we also report system metrics that explain when savings are possible.
+
+\subsubsection{Bandwidth Savings}
+\label{sec:metricBandwidth}
+
+We quantify bandwidth efficiency using \emph{Bandwidth Savings Percentage} (BSP), the relative reduction in transmitted bytes achieved by masking compared to baseline streaming:
+\[
+  \mathrm{BSP} = 100 \cdot
+  \left(1 - \frac{B_{\mathrm{masked}}}{B_{\mathrm{base}}}\right),
+\]
+where $B_{\mathrm{base}}$ is the encoded size of the baseline frame and $B_{\mathrm{masked}}$ is the encoded size of the corresponding masked frame plus its RSEI payload.
+A positive BSP indicates that the masked frame is smaller than the baseline; the magnitude reflects the fraction of bytes saved.
+
+We additionally report per-frame RSEI metadata overhead in bytes to confirm that SEI payloads remain a small fraction of the total bitstream.
+Table~\ref{tab:sei-overhead} reports the side-channel cost as per-frame SEI-equivalent bytes.
+The learned photoreal clips carry about 49--53~B/frame, under 0.5\% of the encoded frame size; Mario is proportionally larger because the pixel video frames are much smaller and the template metadata is heavier.
+
+\begin{table}[t]
+  \centering
+  \small
+  \caption{Per-frame SEI-equivalent side-channel overhead on the CRF23 intake. Frame sizes are mean encoded frame sizes; ``pure'' is the matched no-masking reference.}
+  \label{tab:sei-overhead}
+  \setlength{\tabcolsep}{4pt}
+  \input{exp3/per_frame_sei_overhead_table.tex}
+\end{table}
+
+\parab{System-level reuse metrics.}
+We use \emph{Ref ratio} to measure the fraction of frames emitted as reusable \textbf{Ref} frames.
+We use $S_{\mathrm{mask}}$ for mean masked area as a fraction of the full frame area, which captures how much byte-saving opportunity exists.
+We use $R_{\mathrm{mask}}$ for the fraction of masks matched to reusable templates, which captures whether recurring objects are stable enough to reuse.
+Finally, per-GOP BSP exposes short-window tails that are hidden by clip averages.
+
+\subsubsection{Reconstruction Quality}
+\label{sec:metricQuality}
+
+To verify that client-side stitching preserves visual fidelity, we compare each reconstructed frame against the corresponding baseline frame using three complementary quality metrics (Table~\ref{tab:VideoQualityMetricSummary}).
+
+\begin{table}[t]
+  \centering
+  \small
+  \caption{Video quality metrics used for evaluation.}
+  \label{tab:VideoQualityMetricSummary}
+  \setlength{\tabcolsep}{4pt}
+  \begin{tabular}{@{}lp{0.34\linewidth}p{0.34\linewidth}@{}}
+    \toprule
+    \textbf{Metric} & \textbf{Measures} & \textbf{Scale} \\
+    \midrule
+    PSNR & Pixel-level error & dB ($\uparrow$ better) \\
+    SSIM & Structural similarity & 0--1 ($\uparrow$ better) \\
+    VMAF & Learned perceptual quality & 0--100 ($\uparrow$ better) \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\parab{PSNR}
+Peak Signal-to-Noise Ratio measures per-pixel reconstruction error in decibels~\cite{}.
+It is sensitive to any pixel deviation, making it a strict lower bound on fidelity.
+
+\parab{SSIM}
+Structural Similarity Index compares luminance, contrast, and structural information between the reference and reconstructed frames~\cite{}.
+It correlates more closely with human perception than PSNR because it accounts for spatial structure rather than raw pixel differences.
+
+\parab{VMAF}
+Video Multi-Method Assessment Fusion is a learning-based metric trained on subjective human quality assessments and designed specifically for streaming workloads~\cite{}.
+It fuses multiple spatial and temporal features into a single score per frame.
+Scores above~90 indicate near-transparent quality; scores in the 70--85 range are considered acceptable for streaming; scores below~60 reflect visible degradation.
+
+Together, these three metrics span the spectrum from strict pixel fidelity (PSNR) to perceptual quality (VMAF), providing a comprehensive view of reconstruction accuracy.
+
+\subsubsection{End-to-End Processing Delay}
+\label{sec:metricDelay}
+
+The segment-and-regenerate pipeline adds processing at both the server and the client.
+We define \emph{End-to-End Processing Delay} (EPD) as:
+\[
+  \mathrm{EPD} = D_{\mathrm{server}} + D_{\mathrm{client}}.
+\]
+$D_{\mathrm{server}}$ captures the per-frame latency introduced by the server pipeline (\S\ref{sec:perframe}): YOLO inference, latent-key matching, mask application, and RSEI insertion.
+$D_{\mathrm{client}}$ captures the per-frame latency of the client reconstruction path (\S\ref{sec:reconstruction}): SEI extraction, template lookup, and alpha-blended compositing.
+Both components are measured in milliseconds.
+For real-time viability, EPD must remain well below the frame interval (e.g., 16.7\,ms at 60\,fps).
+
+\subsection{Experiment Roadmap}
+\label{sec:evaluationRoadmap}
+
+The experiments are ordered to move from the most controlled question to increasingly system-level questions.
+Experiment~1 first asks whether RESPAWN changes the bitrate--quality frontier, rather than merely reducing raw encoded bytes.
+For each title, we use held-out clips and compare baseline streaming against RESPAWN at the same bitrate budgets.
+Both arms use identical encoder settings, so any difference comes from masking, metadata, and reconstruction rather than from a more favorable encoder configuration.
+We evaluate quality against the original rendered frames to capture the user-visible result, and we also compare the baseline output against the reconstructed output to check whether stitching preserves the baseline's appearance in the masked region.
+The motivation is to support rate-distortion claims: at a fixed bitrate, RESPAWN should preserve or improve visual quality; at a fixed quality target, it should require fewer delivered bytes.
+
+Experiment~2 then asks whether the apparent savings survive the systems costs that RESPAWN introduces.
+The key concern is that metadata, template delivery, and cache warm-up can erase video-byte savings if they are large or arrive too late.
+We therefore account for masked video bytes, RSEI bytes, and modeled template-delivery bytes together, and evaluate cold and warm cache behavior under several round-trip-time and delivery-delay assumptions.
+Cold start means the client begins with no usable templates and must receive them after first seeing an object.
+Warm start is an optimistic upper bound in which the templates needed by the evaluated clip are already available at the client, modeling reuse from a prior session rather than a practical requirement to download the full template pool at session start.
+We also include a partial-warm sensitivity pass: the client starts with only a popularity-ranked subset of templates, uses Ref mode on cache hits, and falls back to Raw while requesting missing templates.
+To model network timing, we convert RTT into frame time and delay template availability by a fixed number of RTT windows; until the template arrives, affected regions are forced to Raw mode rather than Ref mode.
+The cumulative net-byte curves are designed to reveal break-even time: a scheme is useful only if initial template cost is repaid quickly enough during a session.
+For pixel games, we assume the template library is known before play begins, so this experiment focuses on photoreal titles where template availability is the central uncertainty.
+
+Experiment~3 isolates which design choices are responsible for the observed behavior.
+We vary one component at a time while keeping the rest of the pipeline fixed: boundary feathering, fill color, matching policy, and the stabilization components used by the pixel-game path.
+This ablation structure separates bandwidth effects from reconstruction failures.
+For example, a configuration can increase Ref ratio yet still be undesirable if it causes churn, visible artifacts, or poor region quality.
+The goal is not only to identify the best setting, but also to explain why that setting is safe: matching should avoid unnecessary template creation, gating should prevent visible breakage, fill should reduce bitrate without introducing conspicuous artifacts, and pixel-game stabilization should be justified by measured behavior rather than treated as an ad hoc addition.
+
+Experiment~4 asks when the approach generalizes beyond a single favorable game.
+Instead of grouping clips only by title, we characterize them by properties that should determine whether RESPAWN can help: how much of the frame is masked, how often the object is present, how often a Ref frame is possible, how much the object moves, how variable its appearance is, and whether the content is photoreal or pixel art.
+This experiment links outcomes to causes.
+Large, stable, reusable objects should produce the strongest savings; small, intermittent, or rapidly changing regions should produce weaker gains or graceful fallback.
+The masked-area scatter, Ref-ratio table, and per-GOP savings distribution are intended to show both average behavior and tail behavior, so we do not overclaim from a few favorable clips.
+
+Experiment~5 is the deferred live-pipeline evaluation.
+It will replay game video at real-time pacing, encode baseline and RESPAWN frames at runtime, send them through controlled network conditions, and reconstruct frames on the client as they arrive.
+This experiment is necessary because offline bitrate savings are not sufficient for cloud gaming: a useful system must also avoid queue buildup, missed deadlines, dropped frames, and added end-to-end latency.
+The intended comparison is therefore not bytes alone, but delivered quality and wire bitrate under the same bottleneck while maintaining the same or better frame timing.
+
+\section{Experiment Results}
+\label{sec:ExperimentResults}
+
+We now report the experimental results.
+Experiment~1 evaluates the fixed-VBV bitrate--quality frontier.
+Experiment~2 studies metadata and template-delivery overhead under CRF23 intake.
+Experiment~3 ablates key design choices.
+Experiment~4 analyzes generality and failure modes across content types.
+Experiment~5, the online live-transport evaluation, is deferred.
+
+\subsection{Experiment 1: Bitrate--Quality Frontier}
+\label{sec:exp1}
+
+Experiment~1 sweeps five VBV rate points (8--24~Mbps) on 15 clips (FC5 crop, FM6, Mario) with the \texttt{medium} encoder preset and matched caps on both arms.
+The current FC5 arm uses the selected photoreal latent-key upper-bound profile, FM6 uses the heal-only photoreal pipeline, and Mario uses the pixel template pipeline.
+
+Table~\ref{tab:exp1-fixed-budget} summarizes mean net delivered saving (video + RSEI) by game and rate.
+Mario is the clearest win: +9.3\% mean across 25 points, rising to +16.8\% at 20~Mbps when the baseline spends bits on recurring brick detail.
+FC5 and FM6 sit near break-even ($\approx$0\% and $-0.4\%$ mean) because VBV pegs both arms equally and RSEI overhead erases modest video-only savings on FC5.
+Table~\ref{tab:exp1-fixed-ssim} shows the corresponding SSIM at each nominal bitrate budget.
+The recovered RESPAWN output is consistently below the pure stream, so Experiment~1 should be interpreted as a delivered-byte result with visible reconstruction cost, not as a fixed-budget quality-improvement result.
+The Mario bandwidth improvement is possible because VBV is a rate cap and buffer constraint, not an instruction to make both files exactly the same size: after masking recurring brick detail, the encoder can produce fewer bytes while still staying under the same cap.
+
+\begin{table}[t]
+  \centering
+  \small
+  \caption{Experiment~1: mean net delivered saving (\%) vs.\ matched pure streaming under fixed VBV (video + RSEI).}
+  \label{tab:exp1-fixed-budget}
+  \setlength{\tabcolsep}{4pt}
+  \begin{tabular}{@{}lrrrrrr@{}}
+    \toprule
+    \textbf{Game} & \textbf{8} & \textbf{12} & \textbf{16} & \textbf{20} & \textbf{24} & \textbf{All} \\
+    \midrule
+    FC5  & $-0.21$ & $-0.01$ & $-0.05$ & $+0.09$ & $+0.14$ & $\mathbf{-0.01}$ \\
+    FM6  & $-0.39$ & $-0.49$ & $-0.51$ & $-0.43$ & $-0.33$ & $\mathbf{-0.43}$ \\
+    Mario & $-0.52$ & $+2.30$ & $+9.41$ & $+16.78$ & $+18.49$ & $\mathbf{+9.29}$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{table}[t]
+  \centering
+  \small
+  \caption{Experiment~1: mean full-frame SSIM at each fixed VBV budget. Each cell reports pure-streaming SSIM / recovered RESPAWN SSIM.}
+  \label{tab:exp1-fixed-ssim}
+  \setlength{\tabcolsep}{3pt}
+  \begin{tabular}{@{}lccccc@{}}
+    \toprule
+    \textbf{Game} & \textbf{8 Mbps} & \textbf{12 Mbps} & \textbf{16 Mbps} & \textbf{20 Mbps} & \textbf{24 Mbps} \\
+    \midrule
+    FC5 & 0.964 / 0.897 & 0.976 / 0.907 & 0.982 / 0.911 & 0.986 / 0.914 & 0.988 / 0.916 \\
+    FM6 & 0.960 / 0.921 & 0.973 / 0.931 & 0.980 / 0.936 & 0.983 / 0.938 & 0.986 / 0.940 \\
+    Mario & 0.998 / 0.913 & 0.999 / 0.913 & 1.000 / 0.914 & 1.000 / 0.914 & 1.000 / 0.914 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Experiment~1 numbers are authoritative for rate-point claims; they must not be mixed with CRF23 exploratory intake from Experiments~2 and~4.
+
+\subsection{Experiment 2: Overhead and Template-Delivery Sensitivity}
+\label{sec:exp2}
+
+Experiment~2 asks whether template and control overhead erase nominal masking savings, and how sensitive net bytes are to cache warm-up and RTT.
+The intake is uniform CRF23 + open GOP with 15 clip pairs.
+
+For \emph{photoreal} learned-path clips (FC5, FM6), mean net BSP without synthetic template penalty is +6.2\% averaged over five FC5 clips and +14.1\% averaged over five FM6 clips (delivered video + RSEI only).
+Figure~\ref{fig:exp2-cumulative} shows cumulative net bytes for representative FC5 and FM6 clips.
+Table~\ref{tab:sei-overhead} reports the RSEI cost as per-frame SEI-equivalent bytes.
+The photoreal clips carry about 49--53~B/frame, under 0.5\% of the encoded frame size; Mario is proportionally larger because pixel-video frames are smaller and the template metadata is heavier.
+
+We exclude Mario from Experiment~2's cache/RTT narrative: pixel-game templates are assumed fully known before session start, so Ref ratio and template-delivery delay are not meaningful there.
+Mario CRF23 savings (+30.2\% mean) appear in Experiment~4 instead.
+
+We assume every template has a similar padded size to simplify the template-delay model: 8192~B per delivery, RTT $\in\{20,80,150\}$~ms, delay $\in\{0,2,5\}$ RTT windows, forcing Raw while templates are unavailable.
+These curves are sensitivity bounds, not measured client cache behavior.
+The most impactful factor is template availability, not the precise RTT value.
+In the synthetic photoreal runs, cold start forces many more Raw frames and sends more template bytes than warm start; adding delivery delay mainly hurts cold start because templates are missing exactly when the object first appears.
+The conclusion is therefore conservative: current overhead modeling does not yet prove that cold-start template cost is quickly repaid, and the warm-start result should be read as an optimistic bound rather than evidence that clients should download all templates up front.
+It does show that template availability is the key requirement for making the mechanism net-positive in live sessions, so a practical deployment needs selective prefetching, reuse from prior sessions, or a bounded cache policy.
+Table~\ref{tab:exp2-partial-warm-fm6} tests that policy on FM6 clips 01--04 by preloading only the most reused templates.
+Even a 10\% hot preload cuts forced Raw frames from 37.1\% to 9.3\%, while a 50\% preload reaches +12.83~MB mean net saved without requiring a full-pool download.
+The practical rule is therefore to preload by reuse, use Ref only on cache hit, and otherwise send Raw while asynchronously requesting the missing template.
+
+\input{exp3/partial_warm_fm6_table.tex}
+
+\begin{figure}[t]
+  \centering
+  \begin{minipage}{0.48\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{exp3/fc5_00_23p0_cumulative_net_bytes.png}
+  \end{minipage}\hfill
+  \begin{minipage}{0.48\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{exp3/fm6_04_23p0_cumulative_net_bytes.png}
+  \end{minipage}
+  \caption{Experiment~2: cumulative net bytes under CRF23 intake and synthetic template-delay sensitivity.
+    Left: FC5 \texttt{fc5\_00} (+8.9\% net BSP without synthetic penalty).
+    Right: FM6 \texttt{fm6\_04} (+16.3\%).}
+  \label{fig:exp2-cumulative}
+\end{figure}
+
+\subsection{Experiment 3: Ablations}
+\label{sec:exp3}
+
+Experiment~3 isolates implementation knobs without rerunning the full Experiment~1 sweep.
+
+\parab{Feather width.}
+Table~\ref{tab:exp3-feather} shows that moderate feathering (4--8~px) is the strongest supported result.
+On both FC5 and FM6, 4~px gives the best current BSP while 8--16~px buys marginal recovered-SSIM gains at some bitrate cost.
+We adopt \textbf{4~px} as the default.
+
+\begin{table}[t]
+  \centering
+  \small
+  \caption{Experiment~3: feather-width ablation. Moderate feathering improves boundary quality without giving back the bitrate gain.}
+  \label{tab:exp3-feather}
+  \setlength{\tabcolsep}{4pt}
+  \input{exp4/exp4_feather_table.tex}
+\end{table}
+
+\parab{Fill strategy.}
+Table~\ref{tab:exp3-fill} summarizes fill choices.
+Dominant-color fill is preferred for learned and pixel paths: competitive bytes vs.\ black on FC5 with better recovered SSIM.
+Inpaint on \texttt{fc5\_00} CRF23 improves visual plausibility but \emph{reduces} net BSP; blur fill has no saved run.
+
+\begin{table}[t]
+  \centering
+  \small
+  \caption{Experiment~3: fill-strategy ablation. Dominant fill is the default; inpaint is not a bandwidth win in the saved FC5 run.}
+  \label{tab:exp3-fill}
+  \setlength{\tabcolsep}{4pt}
+  \input{exp4/exp4_fill_strategy_table.tex}
+\end{table}
+
+\parab{Matching strategy.}
+Table~\ref{tab:exp3-matching} reports the first-pass matcher comparison.
+High Ref ratio alone does not imply net savings: FC5 IoU-only reaches higher BSP at lower Ref ratio, while FM6 matchers cluster near 9--10\% BSP but differ in recovered quality and churn.
+
+\begin{table}[t]
+  \centering
+  \small
+  \caption{Experiment~3: matching-strategy ablation. Ref ratio is useful, but churn and recovered quality determine whether reuse becomes a bandwidth win.}
+  \label{tab:exp3-matching}
+  \setlength{\tabcolsep}{4pt}
+  \input{exp4/exp4_matching_strategy_table.tex}
+\end{table}
+
+\parab{Mario pixel path.}
+Table~\ref{tab:exp3-mario} reruns the Mario pixel-path ablation under the same CRF23 five-clip protocol used by Experiment~4.
+The full pipeline matches the reported Mario average (+30.2\%); removing optical flow drops the mean to +25.6\%, while removing Kalman or collapsing to template-only is similar in BSP but remains a separate quality/stability trade-off.
+
+\begin{table}[t]
+  \centering
+  \small
+  \caption{Experiment~3: Mario pixel-path ablation under CRF23 five-clip intake. Values are means over \texttt{mario\_00}--\texttt{mario\_04}.}
+  \label{tab:exp3-mario}
+  \setlength{\tabcolsep}{4pt}
+  \input{exp4/exp4_mario_path_ablation_table.tex}
+\end{table}
+
+\subsection{Experiment 4: Generality and Failure Modes}
+\label{sec:exp4}
+
+Experiment~4 relates net BSP to scene statistics on the same CRF23 intake as Experiment~2.
+Fifteen clips span photoreal (FC5, FM6) and pixel-art (Mario) families.
+
+Figure~\ref{fig:exp4-masked} plots BSP vs.\ masked area for all clips.
+Mario shows the largest savings under CRF23 (+25--37\% per clip; +30.2\% mean) despite smaller masked-area fractions, because brick templates are stable and reusable.
+FM6 clips with large persistent regions (+13--16\% BSP, $\approx$34--42\% masked area) convert opportunity into savings more reliably than FC5 (+4--9\% BSP; +6.2\% mean).
+
+Ref ratio is informative for photoreal clips only; Mario rows saturate at 1.0 under the pre-known-template assumption.
+Table~\ref{tab:exp4-ref-ratio} tabulates photoreal game averages for BSP vs.\ Ref ratio.
+
+\begin{table}[t]
+  \centering
+  \small
+  \caption{Experiment~4: net BSP vs.\ Ref ratio on photoreal CRF23 clips, where $\mathbf{S_{\mathrm{mask}}}$ and $\mathbf{R_{\mathrm{mask}}}$ represent the proportion of the mask area in the entire frame area and the proportion of masks reused in \textbf{Ref} frames, respectively. Mario omitted.}
+  \label{tab:exp4-ref-ratio}
+  \setlength{\tabcolsep}{4pt}
+  \input{exp5/bsp_vs_ref_ratio.tex}
+\end{table}
+
+Figure~\ref{fig:exp4-cdf} shows per-GOP savings CDFs.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.62\linewidth]{exp5/bsp_vs_masked_area.png}
+  \caption{Experiment~4: net BSP vs.\ average masked area (CRF23 intake).
+    Yellow: pixel art (Mario); blue: photoreal (FC5 circle, FM6 square).}
+  \label{fig:exp4-masked}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.62\linewidth]{exp5/per_gop_savings_cdf.png}
+  \caption{Experiment~4: per-game CDF of per-GOP net savings.}
+  \label{fig:exp4-cdf}
+\end{figure}
+
+\parab{Conservative claim.}
+RESPAWN helps most when recurring objects are large, stable, and reusable \emph{and} the rate regime leaves headroom for the baseline to spend bits on masked detail.
+When reuse is sparse or appearance varies rapidly within the ROI, the system falls back with modest quality impact and near-zero net harm under Experiment~1 VBV.
+
+\subsection{Deferred Online Evaluation (Experiment 5)}
+\label{sec:exp5-deferred}
+
+Experiment~5 will evaluate the live pipeline under transport delay, queue buildup, and stall semantics.
+Following prior cloud-gaming systems work (e.g., FEC, congestion control, frame scheduling), the win condition is equal or better delivered quality \emph{without} worse tail latency or stalls---not bytes alone.
+
+\subsection{Limitations}
+\label{sec:eval-limitations}
+
+\begin{itemize}
+  \item \textbf{Encoder regime split:} Experiment~1 fixed VBV and Experiments~2/4 CRF23 intake answer different questions; do not combine their BSP numbers in one claim.
+  \item \textbf{FC5 deployability:} Experiment~1 FC5 is an upper-bound photoreal profile; client heal gating may reduce effective masking.
+  \item \textbf{Synthetic template model:} Experiment~2 cache/RTT curves require real template IDs in RSEI before they can be cited as measured behavior.
+  \item \textbf{Coverage:} Full-frame FC5, blur fill, and multi-clip inpaint ablations remain open.
+  \item \textbf{Online gap:} Experiment~5 is deferred; offline BSP does not imply live QoE wins.
+\end{itemize}
+
+\begin{table}[t]
+  \centering
+  \small
+  \caption{Overview of the evaluation results. This table is intended as a quick review after the detailed experiment discussion.}
+  \label{tab:ExperimentOverview}
+  \setlength{\tabcolsep}{4pt}
+  \begin{tabular}{@{}lp{0.34\linewidth}p{0.38\linewidth}@{}}
+    \toprule
+    \textbf{Exp.} & \textbf{Question} & \textbf{Main takeaway} \\
+    \midrule
+    1 & Fixed-VBV RD frontier & Mario saves +9.3\% on average; FC5/FM6 are near break-even. \\
+    2 & RSEI/template overhead & Photoreal RSEI is under 0.5\% of frame size; FC5/FM6 remain positive under CRF23. \\
+    3 & Design ablations & 4~px feather is default; no-flow drops Mario BSP from +30.2\% to +25.6\%. \\
+    4 & Generality/failures & Mario +30.2\%, FM6 +14.1\%, FC5 +6.2\%; reuse and masked area explain the gap. \\
+    5 & Online transport & Deferred until client/transport integration. \\
+    \bottomrule
+  \end{tabular}
+\end{table}

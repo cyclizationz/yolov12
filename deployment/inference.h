@@ -50,6 +50,10 @@ typedef struct _DL_RESULT
     cv::Mat boxMask; // Added for segmentation mask
     std::string seiPath; // For pixel mode / SEI: relative template path key for stitching
     std::array<float, 32> maskCoeff{}; // YOLOv12-seg mask embedding (latent vector), normalized later if needed
+    // Offline-only metadata for an opt-in multipart semantic object. Empty for
+    // normal detector outputs; merged outputs retain each child bbox so geometry
+    // checks do not rely on the potentially misleading union bbox alone.
+    std::vector<cv::Rect> componentBoxes;
 } DL_RESULT;
 
 class YOLO_V8

@@ -30,7 +30,15 @@ void print_usage(const char *program_name) {
         << "      --latent-bank <path>    Load a prebuilt latent bank\n"
         << "      --latent-no-mint        Match only against prebuilt templates\n"
         << "      --heal-only             Only mask recoverable regions\n"
+        << "      --multipart-object      Merge targeted same-class detections into one compound region\n"
+        << "      --multipart-class <n>   Multipart target class (default: 0, spaceflight cockpit)\n"
+        << "      --multipart-min-components <n> Minimum detections to merge (default: 2)\n"
+        << "      --multipart-geometry-tol <f> Normalized child-geometry RMS gate\n"
         << "      --cache-mode <mode>     cold|warm|partial-warm (recorded/logged)\n"
+        << "      --server-pipeline <0|1> Overlap YOLO inference with server work\n"
+        << "      --server-pipeline-depth <n> Buffered YOLO result queue depth\n"
+        << "      --server-infer-workers <n> Concurrent YOLO inference sessions\n"
+        << "      --server-post-parallel <0|1> Parallelize safe CPU post-processing\n"
         << "      --max-frames <n>        Stop after n frames\n"
         << "      --enc-crf <n>           Encoder CRF\n"
         << "      --enc-bitrate-mbps <f>  Enable target bitrate mode\n"
@@ -109,12 +117,35 @@ int main(int argc, char **argv) {
             opt.latentNoMint = true;
         } else if (arg == "--heal-only") {
             opt.yoloHealOnly = true;
+        } else if (arg == "--multipart-object") {
+            opt.multipartObject = true;
+        } else if (arg == "--multipart-class") {
+            if (!require_value(i, argc, argv, value)) return 2;
+            opt.multipartClass = std::max(0, std::stoi(value));
+        } else if (arg == "--multipart-min-components") {
+            if (!require_value(i, argc, argv, value)) return 2;
+            opt.multipartMinComponents = std::max(2, std::stoi(value));
+        } else if (arg == "--multipart-geometry-tol") {
+            if (!require_value(i, argc, argv, value)) return 2;
+            opt.multipartGeometryTolerance = std::max(0.0f, std::stof(value));
         } else if (arg == "--cache-mode") {
             if (!require_value(i, argc, argv, cache_mode)) return 2;
             if (cache_mode != "cold" && cache_mode != "warm" && cache_mode != "partial-warm") {
                 std::cerr << "Unsupported cache mode: " << cache_mode << "\n";
                 return 2;
             }
+        } else if (arg == "--server-pipeline") {
+            if (!require_value(i, argc, argv, value)) return 2;
+            opt.serverPipeline = (std::stoi(value) != 0);
+        } else if (arg == "--server-pipeline-depth") {
+            if (!require_value(i, argc, argv, value)) return 2;
+            opt.serverPipelineDepth = std::max(1, std::stoi(value));
+        } else if (arg == "--server-infer-workers") {
+            if (!require_value(i, argc, argv, value)) return 2;
+            opt.serverInferWorkers = std::max(1, std::stoi(value));
+        } else if (arg == "--server-post-parallel") {
+            if (!require_value(i, argc, argv, value)) return 2;
+            opt.serverPostParallel = (std::stoi(value) != 0);
         } else if (arg == "--max-frames") {
             if (!require_value(i, argc, argv, value)) return 2;
             opt.maxFrames = std::stoi(value);
@@ -217,6 +248,12 @@ int main(int argc, char **argv) {
               << " source=" << opt.source
               << " outDir=" << opt.outDir
               << " dictDir=" << opt.dictDir
+              << " serverPipeline=" << (opt.serverPipeline ? 1 : 0)
+              << " serverPipelineDepth=" << opt.serverPipelineDepth
+              << " serverInferWorkers=" << opt.serverInferWorkers
+              << " serverPostParallel=" << (opt.serverPostParallel ? 1 : 0)
+              << " multipartObject=" << (opt.multipartObject ? 1 : 0)
+              << " multipartClass=" << opt.multipartClass
               << "\n";
     std::cout << "[OnlineServer] This scaffold emits segmented_output.mp4, "
               << "msk1_payloads.bin, dict/, recovered_output.mp4, and report.json. "

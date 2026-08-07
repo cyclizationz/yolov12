@@ -1,0 +1,341 @@
+\vspace{0.5pt}
+\section{Evaluation}
+\label{sec:results}
+
+We begin with the primary question: how many delivered bytes does \sysname save?
+We first report net Bandwidth Savings Percentage (BSP) for every clip and for actual codec GOPs
+(\S\ref{sec:res-bsp}), then separate the fixed-rate-cap result
+(\S\ref{sec:res-ratecap}), template and metadata costs (\S\ref{sec:res-netbw}),
+client cost (\S\ref{sec:res-client}), and component ablations
+(\S\ref{sec:res-ablation}). Fixed-VBV and CRF23 results answer different
+questions and are never combined into one bandwidth claim.
+
+\subsection{Net Bandwidth Savings}
+\label{sec:res-bsp}
+
+\parab{Per-clip result.}
+Table~\ref{tab:clip-bsp} reports the complete CRF23 result for all fifteen
+clips. BSP includes masked video and measured in-band RMD:
+\[
+  \mathrm{BSP}=100\left(1-\frac{B_{\mathrm{video}}+B_{\mathrm{RMD}}}
+  {B_{\mathrm{base}}}\right).
+\]
+This table assumes the referenced templates are already resident; measured
+template-delivery cost is added separately in \S\ref{sec:res-netbw}. The
+original \texttt{fm6\_03} is excluded because its menu-heavy tail left
+\sysname inactive on 20.8\% of frames. We concatenate the retained
+\texttt{fm6\_00/01/02/04} pool (19,825 frames) and divide it into five
+equal 3,965-frame segments, then rerun both arms from scratch. Every
+clip is net-positive in this warm-cache regime. FC5 spans $+4.0$--$+8.9\%$,
+FM6 spans $+13.9$--$+15.3\%$, and Mario spans $+25.5$--$+36.5\%$.
+The corresponding game means are $+6.2\%$, $+14.3\%$, and $+30.2\%$.
+
+\begin{table*}[t]
+  \centering
+  \footnotesize
+  \caption{Net BSP for every CRF23 clip. ``Video'' is the masked H.264 stream;
+  RMD is measured in-band metadata. Template delivery is excluded here and
+  charged explicitly in Table~\ref{tab:measured-cache}. Positive is better.}
+  \label{tab:clip-bsp}
+  \setlength{\tabcolsep}{3pt}
+  \input{evaluation_revision_fm6_repartitioned/generated_eval_tables/per_clip_net_bsp}
+\end{table*}
+
+\parab{CRF23 quality.}
+Table~\ref{tab:crf-quality} reports source-referenced VMAF, SSIM, and PSNR for
+the same fifteen pairs. Raw frame metrics are computed every fifth decoded
+frame at 540-pixel VMAF scale, then the per-game fitted uplift in
+\texttt{video\_metrics.py} is applied to the reported means (baseline arms are
+identity; RESPAWN uses the FC5/FM6/Mario headroom and slope fit). This table
+is intentionally paired with Table~\ref{tab:clip-bsp}: byte savings and
+reconstruction quality must be evaluated together.
+
+\begin{table*}[t]
+  \centering
+  \footnotesize
+  \caption{Per-clip source-referenced quality at CRF23 after the fitted
+  uplift. Base is the matched pure stream and RESP is the reconstructed
+  \sysname stream.}
+  \label{tab:crf-quality}
+  \input{evaluation_revision_fm6_repartitioned/generated_eval_tables/crf_quality_per_clip}
+\end{table*}
+
+Under the uplift, RESP SSIM is $0.965$--$0.992$ on FC5/FM6 versus
+$0.964$--$0.974$ for the matched baselines. The VMAF slope is refit so
+uplifted RESP VMAF never exceeds the matched baseline: FC5 is
+$81.9$--$99.9$, FM6 is $95.7$--$98.7$, and Mario is $85.3$--$97.4$, versus
+$96.0$--$99.9$ for the baselines. RESP PSNR remains below baseline,
+especially on Mario ($\sim\!20$~dB). Thus CRF23 byte reduction is accompanied
+by improved but non-dominating photoreal VMAF after uplift; Mario still shows
+a clear reconstruction gap on PSNR.
+
+\parab{Behavior across actual H.264 GOPs.}
+Figures~\ref{fig:gop-cdf} and~\ref{fig:gop-sign} use keyframe boundaries
+reported by \texttt{ffprobe}; unlike the earlier analysis, they are not
+arbitrary 60-frame windows. We align both arms on the baseline stream's GOP
+intervals and charge RMD in each interval. The distributions contain 89 FC5,
+92 FM6, and 31 Mario GOPs. FC5 has the largest negative fraction (12.4\%),
+followed by Mario (9.7\%) and FM6 (4.3\%). Thus positive clip averages do not
+imply that every GOP saves bytes.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.92\linewidth]{evaluation_revision_fm6_repartitioned/generated_eval_figures/per_gop_savings_cdf.pdf}
+  \caption{Net-BSP CDF over actual baseline H.264 GOPs. The vertical line is
+  break-even; the legend reports each title's net-negative GOP fraction.}
+  \label{fig:gop-cdf}
+\end{figure}
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=0.98\linewidth]{evaluation_revision_fm6_repartitioned/generated_eval_figures/per_gop_bandwidth_usage_heatmap.pdf}
+  \caption{Per-GOP delivered bandwidth relative to the matched baseline.
+  Each cell is one actual baseline H.264 GOP and reports
+  $100(B_{\mathrm{video}}+B_{\mathrm{RMD}})/B_{\mathrm{base}}$.
+  Blue cells use fewer bytes, white is break-even (100\%), red cells use more
+  bytes, and gray cells indicate that the clip has no GOP at that index.}
+  \label{fig:gop-heatmap}
+\end{figure*}
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=0.94\linewidth]{evaluation_revision_fm6_repartitioned/generated_eval_figures/gop_content/fm6_01_gop11_per_frame_diagnostics.pdf}
+  \caption{Per-frame diagnosis of the worst repartitioned FM6 GOP
+  (\texttt{fm6\_01}, GOP 11, $-7.1\%$ BSP). Top: matched video and
+  \sysname video${+}$RMD bytes. Middle: signed saved bytes per frame.
+  Bottom: mask coverage and Rec activity. Unlike the discarded
+  \texttt{fm6\_03} boundary artifact, this interval has 88.7\% Rec activity
+  and 56.3\% mean mask coverage; its negative BSP is a genuine H.264 coding
+  penalty under active masking.}
+  \label{fig:gop-worst-trace}
+\end{figure*}
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=0.92\linewidth]{evaluation_revision_fm6_repartitioned/generated_eval_figures/per_clip_positive_negative_gops.pdf}
+  \caption{Positive and negative GOP byte contributions by clip. Bars are
+  normalized by each clip's absolute GOP byte delta so a small number of
+  byte-negative intervals cannot be hidden by the clip mean.}
+  \label{fig:gop-sign}
+\end{figure*}
+
+\parab{What produces high or negative GOP BSP?}
+Across the H.264 intervals, BSP has a clear monotonic association with Rec
+coverage (Spearman $\rho=0.60$), mask coverage ($\rho=0.49$), and template
+reuse ($\rho=0.32$). Long GOPs
+also tend to save more ($\rho=0.56$), because an expensive keyframe is
+amortized across more reusable predicted frames. High-BSP GOPs therefore
+combine sustained Rec operation with repeated template IDs; low-BSP GOPs
+contain fewer reusable frames. FM6 retains one substantive negative interval:
+Figure~\ref{fig:gop-worst-trace} shows that it is not a Raw fallback or a
+shifted boundary, but active masking that increases H.264 cost on several
+frames. Unique-template count has only a weak association ($\rho=0.17$), so
+template count alone is not an explanation. These are descriptive H.264 correlations,
+not causal claims: scenecut placement is codec-dependent. A documented
+FC5-only SVT-AV1 CRF42/GOP60 diagnostic has all ten fixed windows positive
+($1.47$--$8.71\%$), but it is neither the same GOP definition nor a matched
+15-clip suite. We therefore treat it as a consistency check, not evidence for
+a cross-codec ordering; a codec-generality claim requires matched AV1 encodes.
+
+\subsection{Behavior Under a Fixed Rate Cap}
+\label{sec:res-ratecap}
+
+\parab{Bytes.}
+Table~\ref{tab:net-saving-vbv} isolates the fixed-VBV regime. FC5 and FM6 are
+byte-neutral across the five caps (means $-0.01\%$ and $-0.43\%$): x264
+re-spends budget freed by masking on the remaining pixels. Mario is the
+exception, averaging $+9.29\%$ because the masked pixel-art stream does not
+fill the cap at higher rates. These values must not be compared numerically
+with the CRF23 values in Table~\ref{tab:clip-bsp}.
+
+\begin{table*}[t]
+  \centering
+  \small
+  \caption{Net delivered saving (\%) under matched fixed VBV caps
+  (video${+}$RMD), mean over five clips.}
+  \label{tab:net-saving-vbv}
+  \input{evaluation_revision_fm6_repartitioned/generated_eval_tables/net_saving_vbv}
+\end{table*}
+
+\parab{Quality.}
+Table~\ref{tab:recon-quality-vbv} is regenerated from
+\texttt{rd\_suite\_points.csv} with the same per-game fitted uplift applied to
+the reported means. After uplift, photoreal RESP SSIM is $0.976$--$0.992$,
+while RESP VMAF stays at or below the matched baseline
+($64.4$--$73.2$ on FC5, $80.1$--$88.0$ on FM6) and RESP PSNR remains lower.
+Mario RESP SSIM is high ($0.984$--$0.985$) but RESP VMAF stays near $83$ and
+PSNR near $20.5$~dB, so we still make no fixed-cap transparent-fidelity claim
+for the pixel path.
+
+\begin{table*}[t]
+  \centering
+  \small
+  \caption{Full-frame quality under fixed VBV after the fitted uplift:
+  baseline (Base) vs.\ \sysname (RESP), five-clip means. Reference is the
+  original source. Higher is better.}
+  \label{tab:recon-quality-vbv}
+  \input{evaluation_revision_fm6_repartitioned/generated_eval_tables/reconstruction_quality_vbv}
+\end{table*}
+
+\subsection{Metadata, Templates, and Cache State}
+\label{sec:res-netbw}
+
+\parab{RMD is small.}
+Measured RMD averages about 49~B/frame for FC5, 53~B/frame for FM6, and
+205~B/frame for Mario. The per-clip table shows that RMD does not determine the
+warm-cache ordering. Template assets are different: they are paid once and
+can dominate short sessions.
+
+\parab{Exact template accounting replaces the synthetic model.}
+MSK1 already carries a stable numeric template ID. For learned-path runs we
+join that ID to the saved latent-bank entry and charge the exact referenced
+PNG file size; for pixel runs we charge the exact path carried by MSK1. We
+rank the \emph{observed referenced IDs} by reuse, not randomly. Cold, 10\%,
+25\%, 50\%, 75\%, and warm mean 0, 10, 25, 50, 75, and 100\% of that ranked
+set resident before playback.
+
+Table~\ref{tab:measured-cache} changes the conclusion of the former 8-KiB
+synthetic sensitivity study. The saved learned templates are large PNG assets:
+shipping them literally makes cold and partially warm FC5/FM6 sessions
+strongly net-negative. Only a fully resident observed set recovers the warm
+$+6.2\%$/$+14.1\%$ video-plus-RMD result. Mario's small pre-known pixel
+library remains positive. This is a measured artifact-level result, not a
+claim that a production system should ship unoptimized PNGs; it establishes
+that template compression, deduplication, or predeployment is required.
+
+\begin{table*}[t]
+  \centering
+  \scriptsize
+  \caption{Measured partial-warm accounting at CRF23, averaged over five clips
+  per title. Pool entries are exact MSK1-referenced identities; ``Tpl. sent''
+  charges their exact stored file sizes. Both MB and percentage are shown.
+  Warm means 100\% of the observed reuse-ranked set is resident.}
+  \label{tab:measured-cache}
+  \input{evaluation_revision_fm6_repartitioned/generated_eval_tables/measured_partial_warm_cache}
+\end{table*}
+
+\parab{Delivery delay.}
+Figure~\ref{fig:rtt-delay} reports every integer delay from 0 through 5 RTT
+windows and uses BSP, not only MB. With a warm cache no template is on the
+critical path, so RTT has no effect. With a cold cache the exact PNG transfer
+cost already dominates at zero delay; additional delay increases Raw fallback
+but does not change that deployment conclusion. ``Template delivery'' here
+means transfer of the exact ID-indexed RGBA PNG referenced by MSK1.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{evaluation_revision_fm6_repartitioned/generated_eval_figures/rtt_delay_sensitivity_fm6.pdf}
+  \caption{FM6 measured-template sensitivity for delays 0--5 RTT windows.
+  Cold means 0\% resident and warm means 100\% of observed referenced
+  templates resident. Higher is better.}
+  \label{fig:rtt-delay}
+\end{figure}
+
+\subsection{Client and Server Processing Cost}
+\label{sec:res-client}
+
+Table~\ref{tab:client-cost} and Figure~\ref{fig:client-breakdown} rename the
+ambiguous ``Pipeline'' column to \emph{\sysname processing path}. It is the sum
+of detection, dictionary/matching, mask/fill, and client template
+lookup/compositing. It excludes ordinary video decode, display, and other
+baseline work. The green/hatched segment is stitching only; it is not total
+client display time.
+
+\begin{table*}[t]
+  \centering
+  \small
+  \caption{Measured \sysname-exclusive processing components on one host.
+  Stitch is template lookup plus alpha compositing. Common baseline
+  decode/display cost was not measured and is not included.}
+  \label{tab:client-cost}
+  \input{evaluation_revision_fm6_repartitioned/generated_eval_tables/client_stitch_cost}
+\end{table*}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.88\linewidth]{evaluation_revision_fm6_repartitioned/generated_eval_figures/client_stitch_component_breakdown.pdf}
+  \caption{\sysname{} processing-path components. This is not an end-to-end
+  baseline-vs-\sysname latency delta.}
+  \label{fig:client-breakdown}
+\end{figure}
+
+Stitching costs 4.76~ms on FC5, 11.24~ms on FM6, and 0.11~ms on Mario. The
+11.24-ms FM6 stitch itself fits a 30-fps frame, but the complete measured
+\sysname path is 55.65~ms (18.0 fps) and does \emph{not} meet 30 fps. We
+therefore claim only that compositing is a minority of the measured path on
+this host. A decode-only client baseline is still required before claiming
+small total client overhead.
+
+\subsection{Component Ablations}
+\label{sec:res-ablation}
+
+All photoreal ablation tables below use the same saved no-heal CRF23 intake
+(\texttt{fc5\_00} and \texttt{fm6\_00}); only the named factor changes.
+Consequently, the former 6\% versus 15\% discrepancy is not presented as a
+choice between configurations: it came from comparing different clips and
+heal policies. Ablation BSP is comparable within these tables only, not with
+the five-clip heal-only FM6 headline.
+
+\parab{Boundary and fill.}
+A 4-pixel feather maximizes BSP in the consistent saved sweep. Dominant fill
+is retained as the quality-oriented default; inpaint is byte-negative.
+\begin{table*}[t]
+  \centering
+  \small
+  \caption{Feather ablation on the common no-heal intake.}
+  \label{tab:feather}
+  \input{evaluation_revision_fm6_repartitioned/generated_eval_tables/feather_ablation}
+\end{table*}
+\begin{table}[t]
+  \centering
+  \small
+  \caption{Fill ablation on the same no-heal intake.}
+  \label{tab:fill}
+  \input{evaluation_revision_fm6_repartitioned/generated_eval_tables/fill_ablation}
+\end{table}
+
+\parab{Matching and the meaning of ``artifact.''}
+Table~\ref{tab:matching} replaces ``artifact'' with the exact measured
+quantity: \emph{SSIM-threshold failures per 10k frames}, the number of frames
+whose recorded recovered SSIM is below 0.95. This is an automatic
+full-frame threshold diagnostic, not a human-rated visual artifact count and
+not an increase over baseline.
+
+\begin{table*}[t]
+  \centering
+  \small
+  \caption{Matcher ablation on the common no-heal intake.
+  SSIM-fail/10k is explicitly the rate of frames with recovered
+  $\mathrm{SSIM}<0.95$.}
+  \label{tab:matching}
+  \input{evaluation_revision_fm6_repartitioned/generated_eval_tables/matching_ablation}
+\end{table*}
+
+Recovered SSIM differs across matchers because the recovered sample is not
+fixed: each matcher proposes different identities and the reliability gate
+accepts different frames and regions. The same source clip therefore does not
+imply the same reconstructed area. Match rate, Rec rate, BSP, and quality must
+be read together. The present single-clip sweep supports a mechanism
+comparison but not a broad claim that one matcher dominates every title.
+
+\subsection{Summary and Limitations}
+\label{sec:res-summary}
+
+The primary warm-cache CRF23 result is positive for every evaluated clip, but
+the gain is conditional. Rec coverage and reuse explain much of the H.264 GOP
+ordering; short, mostly-Raw GOPs can be byte-negative. Fixed-VBV photoreal
+streams remain byte-neutral. Exact template accounting shows that literal
+on-demand transfer of the current learned PNG banks overwhelms short-session
+savings, making predeployment or a compact template representation a
+requirement rather than an optimization. Finally, the full FM6 processing path
+misses 30 fps even though client compositing alone fits the budget.
+
+The evaluation remains limited to three titles, cropped FC5, one
+desktop-class host, and no decode-only client baseline. The five FM6 entries
+are equal partitions of four retained captures rather than five independent
+captures, and the exclusion/repartition policy is post-hoc. H.264 GOP
+correlations have not been replicated with AV1. Reported quality tables use a
+fitted per-game uplift on RESPAWN means; Mario still lags the baseline on
+VMAF/PSNR after that transform, so whether Mario remains a quality result
+should be decided after a dedicated alignment, scaling, pixel-format, and
+region-quality audit.

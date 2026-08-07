@@ -1,0 +1,20 @@
+\begin{table}[t]
+  \centering
+  \small
+  \caption{Experiment~2 partial-warm cache sensitivity on FM6 clips 01--04 at CRF23. Template bytes and net savings are shown as percentages of baseline delivered file size.}
+  \label{tab:exp2-partial-warm-fm6}
+  \setlength{\tabcolsep}{4pt}
+  \begin{tabular}{@{}lrrrrr@{}}
+    \toprule
+    \textbf{Preload} & \textbf{Pool} & \textbf{Raw forced} & \textbf{Tpl. sent} & \textbf{Net saved} & \textbf{First Ref} \\
+    & \textbf{templates} & \textbf{(\% frames)} & \textbf{(\% baseline)} & \textbf{(\% baseline)} & \textbf{(s)} \\
+    \midrule
+    0\% & 0.0/492.2 & 37.1 & 8.93 & -1.11 & 0.037 \\
+    10\% & 49.0/492.2 & 9.3 & 3.48 & +9.06 & 0.000 \\
+    25\% & 123.2/492.2 & 7.7 & 2.90 & +9.88 & 0.000 \\
+    50\% & 246.2/492.2 & 5.1 & 1.93 & +11.34 & 0.000 \\
+    75\% & 369.0/492.2 & 2.6 & 0.97 & +12.79 & 0.000 \\
+    100\% & 492.2/492.2 & 0.0 & 0.00 & +14.15 & 0.000 \\
+    \bottomrule
+  \end{tabular}
+\end{table}

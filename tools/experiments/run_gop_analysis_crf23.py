@@ -20,8 +20,10 @@ from pixel_mario_defaults import mario_pixel_args
 
 FM6_MODEL = REPO_ROOT / "deployment/yolov12n_racing_e300_split1.onnx"
 FC5_MODEL = REPO_ROOT / "deployment/yolov12n_fc5_seg_v1.onnx"
+SPACEFLIGHT_MODEL = REPO_ROOT / "deployment/yolov12n_spaceflight_cockpit_spaceship_e300_v1.onnx"
 FM6_LATENT_BANK = REPO_ROOT / "experiments/encoder_eval/fm6_index_full_v1/dict/latent_bank.json"
 FC5_LATENT_BANK = REPO_ROOT / "experiments/encoder_eval/fc5_crop_index_full_v1/dict/latent_bank.json"
+SPACEFLIGHT_LATENT_BANK = REPO_ROOT / "experiments/encoder_eval/spaceflight_index_v1/dict/latent_bank.json"
 
 ENCODER_ARGS = [
     "--enc-codec",
@@ -71,6 +73,8 @@ def model_for_game(game: str) -> Path:
         return FC5_MODEL
     if game == "fm6":
         return FM6_MODEL
+    if game == "spaceflight":
+        return SPACEFLIGHT_MODEL
     return Path(DEFAULT_MODEL)
 
 
@@ -91,6 +95,17 @@ def game_args(game: str) -> list[str]:
             "--yolo-heal-only",
             "--latent-bank",
             str(FM6_LATENT_BANK),
+            "--latent-thr",
+            "0.86",
+            *MOTION_ARGS,
+            *MASK_ARGS,
+        ]
+    if game == "spaceflight":
+        return [
+            "--latent-key",
+            "--yolo-heal-only",
+            "--latent-bank",
+            str(SPACEFLIGHT_LATENT_BANK),
             "--latent-thr",
             "0.86",
             *MOTION_ARGS,
@@ -136,7 +151,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Run gop_analysis CRF23 offline encodes.")
     ap.add_argument("--manifest", type=Path, default=RESPAWN2026_DIR / "manifest/offline_manifest.json")
     ap.add_argument("--out-root", type=Path, default=RESPAWN2026_DIR / "gop_analysis")
-    ap.add_argument("--game", choices=["fc5", "fm6", "mario"], default="fm6")
+    ap.add_argument("--game", choices=["fc5", "fm6", "mario", "spaceflight"], default="fm6")
     ap.add_argument("--clip-ids", nargs="*", default=[])
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--no-cuda", action="store_true")
@@ -149,6 +164,8 @@ def main() -> None:
         clip_ids = [f"fm6_{i:02d}" for i in range(5)]
     elif args.game == "mario":
         clip_ids = [f"mario_{i:02d}" for i in range(5)]
+    elif args.game == "spaceflight":
+        clip_ids = [f"spaceflight_{i:02d}" for i in range(5)]
     else:
         clip_ids = [f"fc5_{i:02d}" for i in range(5)]
 

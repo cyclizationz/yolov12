@@ -1,0 +1,7 @@
+path: /home/tiehangz/proj/datasets/spaceflight
+train: train/images
+val: val/images
+
+names:
+  0: cockpit
+  1: spaceship

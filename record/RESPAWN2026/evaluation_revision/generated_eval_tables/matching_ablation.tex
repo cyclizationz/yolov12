@@ -1,0 +1,16 @@
+\begin{tabular}{@{}llrrrr@{}}
+\toprule
+\textbf{Game} & \textbf{Matcher} & \textbf{BSP} & \textbf{Match} & \textbf{Rec} & \textbf{SSIM-fail/10k} \\
+ & & \textbf{(\%)} & \textbf{rate} & \textbf{rate} & \\
+\midrule
+FC5 & latent-key & 8.89 & 0.091 & 0.878 & 7208.7 \\
+FC5 & pHash & 8.45 & 0.846 & 0.878 & 6415.1 \\
+FC5 & IoU-only & 8.45 & 0.844 & 0.878 & 6964.5 \\
+FC5 & RGB histogram & 8.45 & 0.882 & 0.878 & 6875.7 \\
+\midrule
+FM6 & latent-key & 15.28 & 0.494 & 0.984 & 5831.7 \\
+FM6 & pHash & 15.05 & 0.999 & 0.984 & 9826.7 \\
+FM6 & IoU-only & 15.05 & 0.999 & 0.984 & 9793.3 \\
+FM6 & RGB histogram & 15.05 & 0.999 & 0.984 & 9826.7 \\
+\bottomrule
+\end{tabular}

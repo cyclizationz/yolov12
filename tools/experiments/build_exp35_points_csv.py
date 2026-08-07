@@ -140,12 +140,16 @@ def mario_specs() -> list[IntakeSpec]:
     return out
 
 
-def fm6_specs() -> list[IntakeSpec]:
+def fm6_specs(
+    *,
+    respawn_root: Path = RESPAWN2026_DIR / "gop_analysis",
+    pure_root: Path = RESPAWN2026_DIR / "exp35_crf",
+) -> list[IntakeSpec]:
     out: list[IntakeSpec] = []
     for i in range(5):
         clip_id = f"fm6_{i:02d}"
-        respawn = RESPAWN2026_DIR / "gop_analysis" / f"{clip_id}_offline_open_x264_crf23"
-        pure = RESPAWN2026_DIR / "exp35_crf" / clip_id / "crf23/pure_streaming"
+        respawn = respawn_root / f"{clip_id}_offline_open_x264_crf23"
+        pure = pure_root / clip_id / "crf23/pure_streaming"
         out.append(
             IntakeSpec(
                 clip_id=clip_id,
@@ -217,14 +221,26 @@ def row_for(
     }
 
 
-def build_specs(*, include_fm6: bool, skip_fc5: bool, skip_mario: bool) -> list[IntakeSpec]:
+def build_specs(
+    *,
+    include_fm6: bool,
+    skip_fc5: bool,
+    skip_mario: bool,
+    fm6_respawn_root: Path,
+    fm6_pure_root: Path,
+) -> list[IntakeSpec]:
     specs: list[IntakeSpec] = []
     if not skip_fc5:
         specs.extend(fc5_specs())
     if not skip_mario:
         specs.extend(mario_specs())
     if include_fm6:
-        specs.extend(fm6_specs())
+        specs.extend(
+            fm6_specs(
+                respawn_root=fm6_respawn_root,
+                pure_root=fm6_pure_root,
+            )
+        )
     return specs
 
 
@@ -233,6 +249,12 @@ def main() -> None:
     ap.add_argument("--out-dir", type=Path, default=RESPAWN2026_DIR / "exp35_crf")
     ap.add_argument("--out-csv", type=Path, default=None)
     ap.add_argument("--include-fm6", action="store_true", help="Include FM6 gop_analysis CRF23 dirs.")
+    ap.add_argument(
+        "--fm6-respawn-root",
+        type=Path,
+        default=RESPAWN2026_DIR / "gop_analysis",
+    )
+    ap.add_argument("--fm6-pure-root", type=Path, default=None)
     ap.add_argument("--skip-fc5", action="store_true")
     ap.add_argument("--skip-mario", action="store_true")
     ap.add_argument("--require-complete", action="store_true", help="Fail if any respawn dir is missing.")
@@ -243,7 +265,13 @@ def main() -> None:
     manifest = {c.clip_id: c for c in load_manifest(RESPAWN2026_DIR / "manifest/offline_manifest.json")}
 
     rows: list[dict[str, Any]] = []
-    for spec in build_specs(include_fm6=args.include_fm6, skip_fc5=args.skip_fc5, skip_mario=args.skip_mario):
+    for spec in build_specs(
+        include_fm6=args.include_fm6,
+        skip_fc5=args.skip_fc5,
+        skip_mario=args.skip_mario,
+        fm6_respawn_root=args.fm6_respawn_root,
+        fm6_pure_root=args.fm6_pure_root or args.out_dir,
+    ):
         if spec.clip_id not in manifest:
             print(f"[skip] unknown clip {spec.clip_id}", file=sys.stderr)
             continue

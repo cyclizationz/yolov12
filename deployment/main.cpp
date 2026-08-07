@@ -57,6 +57,10 @@ void print_usage(const char* program_name) {
               << "  --yolo-matcher <s>      YOLO matcher: latent_key|phash|iou_only|rgb_hist (default: phash unless --latent-key)\n"
               << "  --latent-key            YOLO offline sim: assign template_id by maskCoeff embedding (no client hashing)\n"
               << "  --latent-thr <float>    Cosine similarity threshold for template reuse (default: 0.95)\n"
+              << "  --multipart-object     Merge targeted same-class detections into one compound alpha/template/MSK1 region\n"
+              << "  --multipart-class <n>  Class id targeted by multipart mode (default: 0, spaceflight cockpit)\n"
+              << "  --multipart-min-components <n> Minimum detections to merge (default: 2)\n"
+              << "  --multipart-geometry-tol <f> Normalized child-geometry RMS gate (default: 0.12)\n"
               << "  --latent-period <int>   Base sampling period (default: 2 => ~50% templates)\n"
               << "  --latent-period-skip <f> Skip periodic mint if best cosine >= this (default: disabled)\n"
               << "  --latent-merge <f>      When minting, merge into existing if best cosine >= this (default: disabled)\n"
@@ -183,6 +187,10 @@ int main(int argc, char* argv[]) {
         OPT_MASK_COLOR_LOCAL_STAT = 1047
         ,OPT_FRAME_HYSTERESIS = 1041
         ,OPT_FRAME_HYSTERESIS_CONFIRM = 1042
+        ,OPT_MULTIPART_OBJECT = 1048
+        ,OPT_MULTIPART_CLASS = 1049
+        ,OPT_MULTIPART_MIN_COMPONENTS = 1050
+        ,OPT_MULTIPART_GEOMETRY_TOL = 1051
     };
 
     static struct option long_options[] = {
@@ -216,6 +224,10 @@ int main(int argc, char* argv[]) {
         {"pixel-grid-min-run", required_argument, 0, OPT_PIXEL_GRID_MIN_RUN},
         {"latent-key", no_argument, 0, 'L'},
         {"latent-thr", required_argument, 0, 'Z'},
+        {"multipart-object", no_argument, 0, OPT_MULTIPART_OBJECT},
+        {"multipart-class", required_argument, 0, OPT_MULTIPART_CLASS},
+        {"multipart-min-components", required_argument, 0, OPT_MULTIPART_MIN_COMPONENTS},
+        {"multipart-geometry-tol", required_argument, 0, OPT_MULTIPART_GEOMETRY_TOL},
         {"latent-period", required_argument, 0, 'P'},
         {"latent-period-skip", required_argument, 0, 'K'},
         {"latent-merge", required_argument, 0, 'M'},
@@ -269,6 +281,7 @@ int main(int argc, char* argv[]) {
         {"frame-hysteresis", required_argument, 0, OPT_FRAME_HYSTERESIS},
         {"frame-hysteresis-confirm", required_argument, 0, OPT_FRAME_HYSTERESIS_CONFIRM},
         {"max-frames", required_argument, 0, 'N'},
+        {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
     };
 
@@ -392,6 +405,18 @@ int main(int argc, char* argv[]) {
                 break;
             case 'Z':
                 opt.latentCosineThreshold = std::stof(optarg);
+                break;
+            case OPT_MULTIPART_OBJECT:
+                opt.multipartObject = true;
+                break;
+            case OPT_MULTIPART_CLASS:
+                opt.multipartClass = std::max(0, std::stoi(optarg));
+                break;
+            case OPT_MULTIPART_MIN_COMPONENTS:
+                opt.multipartMinComponents = std::max(2, std::stoi(optarg));
+                break;
+            case OPT_MULTIPART_GEOMETRY_TOL:
+                opt.multipartGeometryTolerance = std::max(0.0f, std::stof(optarg));
                 break;
             case 'P':
                 opt.latentSamplePeriod = std::stoi(optarg);
@@ -671,6 +696,8 @@ int main(int argc, char* argv[]) {
               << " fillInpaintMethod=" << opt.fillInpaintMethod
               << " pixelMaxTemplates=" << opt.pixelMaxTemplates
               << " yoloMatcher=" << (opt.yoloMatcher.empty() ? (opt.yoloLatentKey ? "latent_key" : "phash") : opt.yoloMatcher)
+              << " multipartObject=" << (opt.multipartObject ? 1 : 0)
+              << " multipartClass=" << opt.multipartClass
               << " frameHysteresis=" << (opt.frameModeHysteresis ? 1 : 0)
               << " frameHysteresisConfirm=" << opt.frameModeHysteresisConfirmFrames
               << std::endl;

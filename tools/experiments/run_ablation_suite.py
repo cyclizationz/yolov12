@@ -23,8 +23,10 @@ PIXEL_TEMPLATES = Path("/home/tiehangz/proj/datasets/pixel/templates_rescale")
 PIXEL_SINGLE_TEMPLATE = Path("/home/tiehangz/proj/yolov12/experiments/encoder_eval/_pixel_single_template")
 FM6_MODEL = Path("/home/tiehangz/proj/yolov12/deployment/yolov12n_racing_e300_split1.onnx")
 FC5_MODEL = Path("/home/tiehangz/proj/yolov12/deployment/yolov12n_fc5_seg_v1.onnx")
+SPACEFLIGHT_MODEL = Path("/home/tiehangz/proj/yolov12/deployment/yolov12n_spaceflight_cockpit_spaceship_e300_v1.onnx")
 FM6_LATENT_BANK = Path("/home/tiehangz/proj/yolov12/experiments/encoder_eval/fm6_index_full_v1/dict/latent_bank.json")
 FC5_LATENT_BANK = Path("/home/tiehangz/proj/yolov12/experiments/encoder_eval/fc5_crop_index_full_v1/dict/latent_bank.json")
+SPACEFLIGHT_LATENT_BANK = Path("/home/tiehangz/proj/yolov12/experiments/encoder_eval/spaceflight_index_v1/dict/latent_bank.json")
 
 
 def ffprobe_bitrate_bps(path: Path) -> float:
@@ -150,6 +152,8 @@ def learned_base_args(clip: Any) -> list[str]:
         return base + ["--latent-bank", str(FM6_LATENT_BANK)]
     if clip.game == "fc5":
         return base + ["--latent-bank", str(FC5_LATENT_BANK)]
+    if clip.game == "spaceflight":
+        return base + ["--latent-bank", str(SPACEFLIGHT_LATENT_BANK)]
     return base
 
 
@@ -293,6 +297,8 @@ def model_for_clip(clip: Any) -> Path:
         return FM6_MODEL
     if clip.game == "fc5":
         return FC5_MODEL
+    if clip.game == "spaceflight":
+        return SPACEFLIGHT_MODEL
     return Path(DEFAULT_MODEL)
 
 
@@ -343,7 +349,7 @@ def main() -> None:
         if not clip_configs:
             continue
         clip_input = str(Path(clip.normalized_path)) if args.use_normalized_input else materialize_source_window(clip, args.out_dir)
-        clip_model = model_for_clip(clip)
+        clip_model = Path(args.model) if Path(args.model) != Path(DEFAULT_MODEL) else model_for_clip(clip)
         baseline_dir = args.out_dir / safe_name(clip.clip_id) / "_baseline_current"
         if not args.exp35_encoder and not (baseline_dir / "report.json").exists():
             ensure_dir(baseline_dir)

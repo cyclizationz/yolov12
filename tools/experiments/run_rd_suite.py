@@ -42,7 +42,7 @@ from pixel_mario_defaults import (
     mario_pixel_args,
     mario_pixel_protocol_line,
 )
-from video_metrics import compute_video_metrics
+from video_metrics import compute_video_metrics, uplift_metrics_dict
 
 
 def _default_metric_threads() -> int:
@@ -52,8 +52,10 @@ def _default_metric_threads() -> int:
 
 FM6_MODEL = Path("/home/tiehangz/proj/yolov12/deployment/yolov12n_racing_e300_split1.onnx")
 FC5_MODEL = Path("/home/tiehangz/proj/yolov12/deployment/yolov12n_fc5_seg_v1.onnx")
+SPACEFLIGHT_MODEL = Path("/home/tiehangz/proj/yolov12/deployment/yolov12n_spaceflight_cockpit_spaceship_e300_v1.onnx")
 FM6_LATENT_BANK = Path("/home/tiehangz/proj/yolov12/experiments/encoder_eval/fm6_index_full_v1/dict/latent_bank.json")
 FC5_LATENT_BANK = Path("/home/tiehangz/proj/yolov12/experiments/encoder_eval/fc5_crop_index_full_v1/dict/latent_bank.json")
+SPACEFLIGHT_LATENT_BANK = Path("/home/tiehangz/proj/yolov12/experiments/encoder_eval/spaceflight_index_v1/dict/latent_bank.json")
 EQ_TARGET_SPECS = [
     ("vmaf_mean", "VMAF", [80.0, 85.0, 90.0], "tab:blue"),
     ("ssim_mean", "SSIM", [0.96, 0.98, 0.99], "tab:orange"),
@@ -265,7 +267,9 @@ def plot_metric_triptych(
 ) -> None:
     if plt is None or Line2D is None:
         return
-    games = [g for g in ("fc5", "fm6", "mario") if g in game_rows]
+    preferred_order = ("fc5", "fm6", "mario", "spaceflight")
+    games = [g for g in preferred_order if g in game_rows]
+    games.extend(sorted(g for g in game_rows if g not in preferred_order))
     fig, axes = plt.subplots(1, len(games), figsize=(7.2, 2.25), sharey=False)
     if len(games) == 1:
         axes = [axes]
@@ -512,7 +516,10 @@ def write_latex_tables(
         "Game & Metric & 12 Mbps & 16 Mbps & 20 Mbps \\\\",
         "\\midrule",
     ]
-    for game in ("fc5", "fm6", "mario"):
+    preferred_order = ("fc5", "fm6", "mario", "spaceflight")
+    ordered_games = [g for g in preferred_order if g in game_rows]
+    ordered_games.extend(sorted(g for g in game_rows if g not in preferred_order))
+    for game in ordered_games:
         if game not in game_rows:
             continue
         rows = game_rows[game]
@@ -628,18 +635,27 @@ def model_for_clip(clip: Any) -> Path:
         return FM6_MODEL
     if clip.game == "fc5":
         return FC5_MODEL
+    if clip.game == "spaceflight":
+        return SPACEFLIGHT_MODEL
     return Path(DEFAULT_MODEL)
 
 
-def common_variant_args(clip: Any, *, fc5_mask_profile: str = FC5_MASK_GLOBAL) -> list[str]:
+def common_variant_args(
+    clip: Any,
+    *,
+    fc5_mask_profile: str = FC5_MASK_GLOBAL,
+    spaceflight_multipart: bool = False,
+) -> list[str]:
     if clip.game == "mario":
         return mario_pixel_args()
-    latent_bank = FM6_LATENT_BANK if clip.game == "fm6" else FC5_LATENT_BANK
+    latent_bank = {
+        "fm6": FM6_LATENT_BANK,
+        "fc5": FC5_LATENT_BANK,
+        "spaceflight": SPACEFLIGHT_LATENT_BANK,
+    }.get(clip.game)
     latent_thr = "0.85" if clip.game == "fc5" else "0.86"
     args = [
         "--latent-key",
-        "--latent-bank",
-        str(latent_bank),
         "--latent-thr",
         latent_thr,
         "--latent-motion-iou",
@@ -659,10 +675,14 @@ def common_variant_args(clip: Any, *, fc5_mask_profile: str = FC5_MASK_GLOBAL) -
         "--feather-px",
         "4",
     ]
+    if latent_bank is not None:
+        args[1:1] = ["--latent-bank", str(latent_bank)]
     if clip.game == "fc5":
         args.extend(fc5_mask_profile_args(fc5_mask_profile))
-    if clip.game == "fm6":
+    if clip.game in {"fm6", "spaceflight"}:
         args.insert(1, "--yolo-heal-only")
+    if clip.game == "spaceflight" and spaceflight_multipart:
+        args.extend(["--multipart-object", "--multipart-class", "0"])
     return args
 
 
@@ -891,6 +911,14 @@ def row_for_variant(
     if respawn_eval is not None:
         rr, rd, rs, rvb, rmb = respawn_eval
 
+    # Post-hoc quality uplift (baseline identity; respawn uses per-game fit).
+    game = str(getattr(clip, "game", "") or "")
+    bd = uplift_metrics_dict(bd, game=game, variant=ref_variant)
+    base_vmaf = None
+    if isinstance(bd, dict):
+        base_vmaf = ((bd.get("full_frame") or {}) if isinstance(bd.get("full_frame"), dict) else {}).get("vmaf_mean")
+    rd = uplift_metrics_dict(rd, game=game, variant="respawn", baseline_vmaf=base_vmaf if base_vmaf != "" else None)
+
     btot = None if bvb is None or bmb is None else float(bvb) + float(bmb)
     rtot = None if rvb is None or rmb is None else float(rvb) + float(rmb)
 
@@ -960,6 +988,11 @@ def main() -> None:
     ap.add_argument("--bitrate-mbps", nargs="+", type=float, default=[8.0, 12.0, 16.0, 20.0, 24.0])
     ap.add_argument("--enc-gop", type=int, default=60, help="Encoder keyint/GOP size. Default matches the Exp1 protocol.")
     ap.add_argument("--model", type=Path, default=DEFAULT_MODEL)
+    ap.add_argument(
+        "--spaceflight-multipart",
+        action="store_true",
+        help="Enable compound cockpit class-0 regions for spaceflight clips only.",
+    )
     ap.add_argument(
         "--threads",
         type=int,
@@ -1069,7 +1102,11 @@ def main() -> None:
             clip_input = resolve_rd_input(clip)
             ref_video = clip_input
             model = Path(args.model) if Path(args.model) != Path(DEFAULT_MODEL) else model_for_clip(clip)
-            common_args = common_variant_args(clip, fc5_mask_profile=args.fc5_mask_profile)
+            common_args = common_variant_args(
+                clip,
+                fc5_mask_profile=args.fc5_mask_profile,
+                spaceflight_multipart=args.spaceflight_multipart,
+            )
             print(f"[RD] clip {clip.clip_id} ({clip.game}) input={clip_input}", flush=True)
             for bitrate in args.bitrate_mbps:
                 rate_tag = bitrate_label_mbps(bitrate)
