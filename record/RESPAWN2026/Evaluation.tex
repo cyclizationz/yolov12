@@ -1,3 +1,24 @@
+\textcolor{blue}{\parab{GRACE comparison.}
+GRACE is a loss-resilient neural video codec trained with randomly removed
+latent coefficients so that its decoder degrades gracefully when part of the
+representation is unavailable~\cite{grace_nsdi24}. We compare GRACE and
+\sysname as separate systems at zero loss on one complete representative clip
+from each photoreal title (FC5, FM6, and Spaceflight), reusing \sysname's saved
+CRF23 run. GRACE receives the normalized source directly; frames are
+edge-padded on the bottom and right to
+the next multiple of 128 and cropped back after decoding. For each title, we
+select the measured released GRACE rate checkpoint whose source-referenced
+VMAF is nearest to that of \sysname's reconstructed output, and report
+source-referenced VMAF and SSIM for both systems. GRACE size includes actual
+torchac entropy payloads, BPG refresh payloads, and per-frame framing metadata.
+\sysname size includes the H.264 video and measured in-band RMD; referenced
+templates are assumed resident before use, so preload and runtime template
+delivery contribute zero bytes. Because the released GRACE code has no
+entropy-decoding path, its frames are decoded in memory from the same
+quantized latent codes whose payload bytes are written. The resulting GRACE
+size is therefore a measured research-container payload, not an official
+interoperable wire bitstream.}
+
 \vspace{0.5pt}
 \section{Evaluation}
 \label{sec:results}
@@ -9,6 +30,9 @@ We first report net Bandwidth Savings Percentage (BSP) for every clip and for ac
 client cost (\S\ref{sec:res-client}), and component ablations
 (\S\ref{sec:res-ablation}). Fixed-VBV and CRF23 results answer different
 questions and are never combined into one bandwidth claim.
+\textcolor{purple}{We additionally compare \sysname directly with a
+loss-resilient neural codec on full representative clips
+(\S\ref{sec:res-grace}).}
 
 \subsection{Net Bandwidth Savings}
 \label{sec:res-bsp}
@@ -29,6 +53,8 @@ equal 3,965-frame segments, then rerun both arms from scratch. Every
 clip is net-positive in this warm-cache regime. FC5 spans $+4.0$--$+8.9\%$,
 FM6 spans $+13.9$--$+15.3\%$, and Mario spans $+25.5$--$+36.5\%$.
 The corresponding game means are $+6.2\%$, $+14.3\%$, and $+30.2\%$.
+\textcolor{red}{Five Star Citizen (SC) clips extend this evaluation to twenty clips.
+SC spans $+13.3$--$+34.9\%$ BSP, with a mean of $+24.8\%$.}
 
 \begin{table*}[t]
   \centering
@@ -38,7 +64,7 @@ The corresponding game means are $+6.2\%$, $+14.3\%$, and $+30.2\%$.
   charged explicitly in Table~\ref{tab:measured-cache}. Positive is better.}
   \label{tab:clip-bsp}
   \setlength{\tabcolsep}{3pt}
-  \input{evaluation_revision_fm6_repartitioned/generated_eval_tables/per_clip_net_bsp}
+  \input{new_figures/spaceflight/per_clip_net_bsp.tex}
 \end{table*}
 
 \parab{CRF23 quality.}
@@ -49,6 +75,8 @@ frame at 540-pixel VMAF scale, then the per-game fitted uplift in
 identity; RESPAWN uses the FC5/FM6/Mario headroom and slope fit). This table
 is intentionally paired with Table~\ref{tab:clip-bsp}: byte savings and
 reconstruction quality must be evaluated together.
+\textcolor{red}{SC adds five direct-measurement rows. Its quality is sampled every fifth
+frame at 720-pixel VMAF scale and receives no fitted post-hoc uplift.}
 
 \begin{table*}[t]
   \centering
@@ -57,7 +85,7 @@ reconstruction quality must be evaluated together.
   uplift. Base is the matched pure stream and RESP is the reconstructed
   \sysname stream.}
   \label{tab:crf-quality}
-  \input{evaluation_revision_fm6_repartitioned/generated_eval_tables/crf_quality_per_clip}
+  \input{new_figures/spaceflight/crf_quality_per_clip.tex}
 \end{table*}
 
 Under the uplift, RESP SSIM is $0.965$--$0.992$ on FC5/FM6 versus
@@ -68,6 +96,9 @@ $96.0$--$99.9$ for the baselines. RESP PSNR remains below baseline,
 especially on Mario ($\sim\!20$~dB). Thus CRF23 byte reduction is accompanied
 by improved but non-dominating photoreal VMAF after uplift; Mario still shows
 a clear reconstruction gap on PSNR.
+\textcolor{red}{Direct SC RESP VMAF is $68.8$--$84.1$ versus
+$96.6$--$99.3$ for its matched baselines, so the SC result is a bandwidth
+result rather than a transparent-fidelity claim.}
 
 \parab{Behavior across actual H.264 GOPs.}
 Figures~\ref{fig:gop-cdf} and~\ref{fig:gop-sign} use keyframe boundaries
@@ -77,10 +108,11 @@ intervals and charge RMD in each interval. The distributions contain 89 FC5,
 92 FM6, and 31 Mario GOPs. FC5 has the largest negative fraction (12.4\%),
 followed by Mario (9.7\%) and FM6 (4.3\%). Thus positive clip averages do not
 imply that every GOP saves bytes.
+\textcolor{red}{SC adds 27 measured GOPs, all of which are net-positive.}
 
 \begin{figure}[t]
   \centering
-  \includegraphics[width=0.92\linewidth]{evaluation_revision_fm6_repartitioned/generated_eval_figures/per_gop_savings_cdf.pdf}
+  \includegraphics[width=0.92\linewidth]{new_figures/spaceflight/per_gop_savings_cdf.pdf}
   \caption{Net-BSP CDF over actual baseline H.264 GOPs. The vertical line is
   break-even; the legend reports each title's net-negative GOP fraction.}
   \label{fig:gop-cdf}
@@ -88,7 +120,7 @@ imply that every GOP saves bytes.
 
 \begin{figure*}[t]
   \centering
-  \includegraphics[width=0.98\linewidth]{evaluation_revision_fm6_repartitioned/generated_eval_figures/per_gop_bandwidth_usage_heatmap.pdf}
+  \includegraphics[width=0.98\linewidth]{new_figures/spaceflight/per_gop_bandwidth_usage_heatmap.pdf}
   \caption{Per-GOP delivered bandwidth relative to the matched baseline.
   Each cell is one actual baseline H.264 GOP and reports
   $100(B_{\mathrm{video}}+B_{\mathrm{RMD}})/B_{\mathrm{base}}$.
@@ -112,7 +144,18 @@ imply that every GOP saves bytes.
 
 \begin{figure*}[t]
   \centering
-  \includegraphics[width=0.92\linewidth]{evaluation_revision_fm6_repartitioned/generated_eval_figures/per_clip_positive_negative_gops.pdf}
+  \includegraphics[width=0.94\linewidth]{new_figures/spaceflight/spaceflight_04_gop3_per_frame_diagnostics.pdf}
+  \caption{\textcolor{red}{Per-frame diagnosis of the lowest-saving SC GOP
+  (\texttt{spaceflight\_04}, GOP 3, $+3.44\%$ BSP). Top: matched video and
+  \sysname video${+}$RMD bytes. Middle: signed saved bytes per frame.
+  Bottom: mask coverage and Rec activity. Even this lowest SC interval remains
+  net-positive.}}
+  \label{fig:gop-sc-worst-trace}
+\end{figure*}
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=0.92\linewidth]{new_figures/spaceflight/per_clip_positive_negative_gops.pdf}
   \caption{Positive and negative GOP byte contributions by clip. Bars are
   normalized by each clip's absolute GOP byte delta so a small number of
   byte-negative intervals cannot be hidden by the clip mean.}
@@ -136,6 +179,8 @@ FC5-only SVT-AV1 CRF42/GOP60 diagnostic has all ten fixed windows positive
 ($1.47$--$8.71\%$), but it is neither the same GOP definition nor a matched
 15-clip suite. We therefore treat it as a consistency check, not evidence for
 a cross-codec ordering; a codec-generality claim requires matched AV1 encodes.
+\textcolor{red}{For SC, mask coverage, Rec activity, and reuse likewise accompany
+positive GOP savings; even its lowest-saving GOP remains at $+3.44\%$.}
 
 \subsection{Behavior Under a Fixed Rate Cap}
 \label{sec:res-ratecap}
@@ -147,6 +192,8 @@ re-spends budget freed by masking on the remaining pixels. Mario is the
 exception, averaging $+9.29\%$ because the masked pixel-art stream does not
 fill the cap at higher rates. These values must not be compared numerically
 with the CRF23 values in Table~\ref{tab:clip-bsp}.
+\textcolor{red}{SC averages $+2.28\%$ under the same fixed-cap accounting,
+rising from $+1.64\%$ at 8~Mbps to $+3.40\%$ at 24~Mbps.}
 
 \begin{table*}[t]
   \centering
@@ -154,7 +201,7 @@ with the CRF23 values in Table~\ref{tab:clip-bsp}.
   \caption{Net delivered saving (\%) under matched fixed VBV caps
   (video${+}$RMD), mean over five clips.}
   \label{tab:net-saving-vbv}
-  \input{evaluation_revision_fm6_repartitioned/generated_eval_tables/net_saving_vbv}
+  \input{new_figures/spaceflight/net_saving_vbv.tex}
 \end{table*}
 
 \parab{Quality.}
@@ -166,6 +213,8 @@ while RESP VMAF stays at or below the matched baseline
 Mario RESP SSIM is high ($0.984$--$0.985$) but RESP VMAF stays near $83$ and
 PSNR near $20.5$~dB, so we still make no fixed-cap transparent-fidelity claim
 for the pixel path.
+\textcolor{red}{SC likewise reports direct measured quality without an uplift and
+has no all-clip overlapping interval for a BD-rate claim.}
 
 \begin{table*}[t]
   \centering
@@ -174,7 +223,7 @@ for the pixel path.
   baseline (Base) vs.\ \sysname (RESP), five-clip means. Reference is the
   original source. Higher is better.}
   \label{tab:recon-quality-vbv}
-  \input{evaluation_revision_fm6_repartitioned/generated_eval_tables/reconstruction_quality_vbv}
+  \input{new_figures/spaceflight/reconstruction_quality_vbv.tex}
 \end{table*}
 
 \subsection{Metadata, Templates, and Cache State}
@@ -185,6 +234,7 @@ Measured RMD averages about 49~B/frame for FC5, 53~B/frame for FM6, and
 205~B/frame for Mario. The per-clip table shows that RMD does not determine the
 warm-cache ordering. Template assets are different: they are paid once and
 can dominate short sessions.
+\textcolor{red}{SC contributes 55~B/frame of measured RMD on average.}
 
 \parab{Exact template accounting replaces the synthetic model.}
 MSK1 already carries a stable numeric template ID. For learned-path runs we
@@ -211,7 +261,7 @@ that template compression, deduplication, or predeployment is required.
   charges their exact stored file sizes. Both MB and percentage are shown.
   Warm means 100\% of the observed reuse-ranked set is resident.}
   \label{tab:measured-cache}
-  \input{evaluation_revision_fm6_repartitioned/generated_eval_tables/measured_partial_warm_cache}
+  \input{new_figures/spaceflight/measured_partial_warm_cache.tex}
 \end{table*}
 
 \parab{Delivery delay.}
@@ -221,10 +271,11 @@ critical path, so RTT has no effect. With a cold cache the exact PNG transfer
 cost already dominates at zero delay; additional delay increases Raw fallback
 but does not change that deployment conclusion. ``Template delivery'' here
 means transfer of the exact ID-indexed RGBA PNG referenced by MSK1.
+\textcolor{red}{The SC rows use the same exact referenced-template accounting.}
 
 \begin{figure}[t]
   \centering
-  \includegraphics[width=\linewidth]{evaluation_revision_fm6_repartitioned/generated_eval_figures/rtt_delay_sensitivity_fm6.pdf}
+  \includegraphics[width=\linewidth]{new_figures/spaceflight/rtt_delay_sensitivity_fm6.pdf}
   \caption{FM6 measured-template sensitivity for delays 0--5 RTT windows.
   Cold means 0\% resident and warm means 100\% of observed referenced
   templates resident. Higher is better.}
@@ -248,12 +299,12 @@ client display time.
   Stitch is template lookup plus alpha compositing. Common baseline
   decode/display cost was not measured and is not included.}
   \label{tab:client-cost}
-  \input{evaluation_revision_fm6_repartitioned/generated_eval_tables/client_stitch_cost}
+  \input{new_figures/spaceflight/client_stitch_cost.tex}
 \end{table*}
 
 \begin{figure}[t]
   \centering
-  \includegraphics[width=0.88\linewidth]{evaluation_revision_fm6_repartitioned/generated_eval_figures/client_stitch_component_breakdown.pdf}
+  \includegraphics[width=0.88\linewidth]{new_figures/spaceflight/client_stitch_component_breakdown.pdf}
   \caption{\sysname{} processing-path components. This is not an end-to-end
   baseline-vs-\sysname latency delta.}
   \label{fig:client-breakdown}
@@ -265,6 +316,8 @@ Stitching costs 4.76~ms on FC5, 11.24~ms on FM6, and 0.11~ms on Mario. The
 therefore claim only that compositing is a minority of the measured path on
 this host. A decode-only client baseline is still required before claiming
 small total client overhead.
+\textcolor{red}{SC stitching costs 7.15~ms, while its complete measured
+\sysname path is 115.60~ms ($8.65$ fps) and therefore also misses real time.}
 
 \subsection{Component Ablations}
 \label{sec:res-ablation}
@@ -275,6 +328,8 @@ Consequently, the former 6\% versus 15\% discrepancy is not presented as a
 choice between configurations: it came from comparing different clips and
 heal policies. Ablation BSP is comparable within these tables only, not with
 the five-clip heal-only FM6 headline.
+\textcolor{red}{SC adds five-clip means for the matching and fill sweeps under
+its heal-only multipart-class-0 policy; no new SC feather sweep is included.}
 
 \parab{Boundary and fill.}
 A 4-pixel feather maximizes BSP in the consistent saved sweep. Dominant fill
@@ -284,14 +339,14 @@ is retained as the quality-oriented default; inpaint is byte-negative.
   \small
   \caption{Feather ablation on the common no-heal intake.}
   \label{tab:feather}
-  \input{evaluation_revision_fm6_repartitioned/generated_eval_tables/feather_ablation}
+  \input{new_figures/spaceflight/feather_ablation.tex}
 \end{table*}
 \begin{table}[t]
   \centering
   \small
   \caption{Fill ablation on the same no-heal intake.}
   \label{tab:fill}
-  \input{evaluation_revision_fm6_repartitioned/generated_eval_tables/fill_ablation}
+  \input{new_figures/spaceflight/fill_ablation.tex}
 \end{table}
 
 \parab{Matching and the meaning of ``artifact.''}
@@ -308,7 +363,7 @@ not an increase over baseline.
   SSIM-fail/10k is explicitly the rate of frames with recovered
   $\mathrm{SSIM}<0.95$.}
   \label{tab:matching}
-  \input{evaluation_revision_fm6_repartitioned/generated_eval_tables/matching_ablation}
+  \input{new_figures/spaceflight/matching_ablation.tex}
 \end{table*}
 
 Recovered SSIM differs across matchers because the recovered sample is not
@@ -317,6 +372,54 @@ accepts different frames and regions. The same source clip therefore does not
 imply the same reconstructed area. Match rate, Rec rate, BSP, and quality must
 be read together. The present single-clip sweep supports a mechanism
 comparison but not a broad claim that one matcher dominates every title.
+\textcolor{red}{The SC five-clip matcher rows provide an additional mechanism
+comparison under its multipart policy, not a cross-title ranking.}
+
+
+\begingroup
+\color{purple}
+\subsection{Direct Comparison with a Loss-Resilient Neural Codec}
+\label{sec:res-grace}
+
+We use the authors' released GRACE implementation and pretrained checkpoints
+for a separate-system, zero-loss comparison on one complete representative
+clip per photoreal title. GRACE encodes the normalized source, while
+\sysname uses its saved CRF23 reconstructed output and video-plus-RMD byte
+accounting. We choose the measured GRACE checkpoint nearest to \sysname in
+source-referenced VMAF; because the released checkpoints are discrete, SSIM
+and VMAF are reported together rather than asserted to match exactly.
+
+\begin{table*}[t]
+  \centering
+  \scriptsize
+  \caption{Full-clip zero-loss comparison with GRACE at the nearest measured
+  VMAF checkpoint. GRACE payload includes entropy-coded latent, BPG refresh,
+  and framing bytes; its BSP uses the matched H.264 baseline as denominator.
+  \sysname includes video and RMD. Templates are resident before use, so
+  runtime template bytes are zero and Video+RMD equals All-in. Positive BSP is
+  better.}
+  \label{tab:grace-direct}
+  \input{grace_comparison/full/grace_direct_comparison.tex}
+\end{table*}
+
+At the nearest available VMAF point, \sysname uses fewer bytes on all three
+clips. On FC5, GRACE delivers 27.70~MB ($-19.84\%$ BSP) at VMAF 54.29,
+whereas \sysname delivers 21.06~MB ($+8.90\%$) at VMAF 51.51. On FM6, the
+VMAF scores are nearly equal (68.57 versus 68.95), but GRACE delivers
+152.02~MB ($-44.08\%$) and \sysname 90.87~MB ($+13.88\%$). On Spaceflight,
+\sysname attains both higher VMAF (69.04 versus 65.48) and greater savings:
+5.05~MB and $+21.99\%$ BSP versus GRACE's 6.35~MB and $+1.93\%$.
+Thus, under this zero-loss payload accounting, \sysname wins the bandwidth
+comparison for each representative clip; GRACE's distinct benefit is loss
+resilience, which this experiment does not evaluate.
+
+The comparison is full-clip and source-referenced, but it is not an
+end-to-end network experiment. GRACE's payload is a framed research artifact
+rather than an official wire format, and decoding uses the encoded latent
+codes in memory because the released entropy decoder is unimplemented.
+Checkpoint matching is approximate, and no packet-loss, latency, or playback
+stability result is inferred.
+\endgroup
 
 \subsection{Summary and Limitations}
 \label{sec:res-summary}
@@ -329,6 +432,11 @@ on-demand transfer of the current learned PNG banks overwhelms short-session
 savings, making predeployment or a compact template representation a
 requirement rather than an optimization. Finally, the full FM6 processing path
 misses 30 fps even though client compositing alone fits the budget.
+\textcolor{red}{All 27 SC GOPs are positive, SC averages $+2.28\%$ under fixed
+VBV, and its full measured processing path also misses 30 fps.}
+\textcolor{purple}{At the nearest measured VMAF checkpoint, \sysname uses fewer
+bytes than GRACE on each full representative clip; GRACE's loss-resilience
+advantage remains orthogonal and is not measured by this zero-loss comparison.}
 
 The evaluation remains limited to three titles, cropped FC5, one
 desktop-class host, and no decode-only client baseline. The five FM6 entries
@@ -339,3 +447,11 @@ fitted per-game uplift on RESPAWN means; Mario still lags the baseline on
 VMAF/PSNR after that transform, so whether Mario remains a quality result
 should be decided after a dedicated alignment, scaling, pixel-format, and
 region-quality audit.
+\textcolor{red}{SC extends the evaluation to a fourth title, but its
+1280$\times$720@30.303-fps, heal-only multipart-class-0 protocol differs
+from the FC5/FM6 regimes, so cross-title comparisons remain descriptive.}
+\textcolor{purple}{The GRACE comparison covers one full clip per photoreal
+title and only a subset of discrete released rate checkpoints. Its framed
+payload is not an official wire format, checkpoint quality is only
+approximately matched, and packet loss, latency, and playback stability are
+not evaluated.}
